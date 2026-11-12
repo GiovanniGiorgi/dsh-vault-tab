@@ -445,7 +445,7 @@ window.__ModuleLoader__.load({
             guide: [
               {
                 id: 'vault-root',
-                order: 20,
+                order: 15,
                 title: function () {
                   return t('guide.title');
                 },
