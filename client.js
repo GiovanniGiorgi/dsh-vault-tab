@@ -30,8 +30,8 @@ window.__ModuleLoader__.load({
         failed: 'Cannot read this folder',
         empty: 'Empty folder',
         other: 'Not a file or directory',
-        missing: 'Vault folder not found: {path}',
-        missingHint: 'Pick your folder in Plugins → Vault Tab (field “Vault path”), or create this one.',
+        missing: 'Vault not found',
+        missingHint: 'Pick your folder in Plugins → Vault Tab (field “Vault path”), or create this path.',
         'config.title': 'Vault',
         'config.help': 'Absolute path of the folder this tab lists (empty: a Vault folder in the server home). Saving applies immediately; press Reload in the Vault tab to see the new tree.',
         'config.rootLabel': 'Vault path',
@@ -106,6 +106,11 @@ window.__ModuleLoader__.load({
       '.dvt_other{color:var(--dsw-alias-label-tertiary);cursor:default}',
       '.dvt_other:hover{background:0 0}',
       '.dvt_note{color:var(--dsw-alias-label-tertiary);margin:0;padding:3px 10px;font-size:12px}',
+      '.dvt_empty{flex-direction:column;flex:auto;justify-content:center;align-items:center;gap:2px;padding:24px;display:flex}',
+      '.dvt_emptyIcon{color:var(--dsw-alias-label-tertiary);opacity:.55;margin-bottom:6px}',
+      '.dvt_emptyTitle{color:var(--dsw-alias-label-primary);font-weight:600;font-size:15px;margin:0}',
+      '.dvt_emptyHint{color:var(--dsw-alias-label-secondary);text-align:center;font-size:var(--dsh-content-font-size-secondary,13px);max-width:38ch;margin:0;line-height:1.5}',
+      '.dvt_emptyPath{color:var(--dsw-alias-label-tertiary);font-family:var(--dsh-font-family-mono, monospace);text-align:center;font-size:12px;overflow-wrap:anywhere;max-width:38ch;margin:4px 0 0}',
       '.dvt_status{flex-direction:column;padding:12px 10px;display:flex}',
       '.dvt_statusLine{color:var(--dsw-alias-label-secondary);font-size:var(--dsh-content-font-size-secondary,13px);margin:0;line-height:1.6}',
       '.dvt_tool{width:28px;height:28px;color:var(--dsw-alias-label-secondary);border-radius:var(--dsw-radius-sm);cursor:pointer;background:0 0;border:none;flex:none;justify-content:center;align-items:center;padding:6px;line-height:1;display:inline-flex}',
@@ -153,7 +158,7 @@ window.__ModuleLoader__.load({
       const size = props && props.size ? props.size : 16;
       return h(
         'svg',
-        { viewBox: '0 0 16 16', width: size, height: size, 'aria-hidden': true, style: { display: 'block', flex: 'none' } },
+        { viewBox: '0 0 16 16', width: size, height: size, 'aria-hidden': true, className: props && props.className, style: { display: 'block', flex: 'none' } },
         h('path', {
           d: 'M1.75 3.5A1.25 1.25 0 0 1 3 2.25h2.35c.4 0 .78.16 1.06.44l.9.9H13a1.25 1.25 0 0 1 1.25 1.25v6.91A1.5 1.5 0 0 1 12.75 13.25h-9A2 2 0 0 1 1.75 11.25V3.5Z',
           fill: '#2f9e8f',
@@ -350,10 +355,12 @@ window.__ModuleLoader__.load({
           { className: 'dvt_body' },
           missingRoot !== null
             ? h(
-                'ul',
-                { className: 'dvt_level' },
-                h('li', { className: 'dvt_note' }, t('missing', { path: missingRoot || '?' })),
-                h('li', { className: 'dvt_note' }, t('missingHint')),
+                'div',
+                { className: 'dvt_empty' },
+                h(VaultIcon, { size: 36, className: 'dvt_emptyIcon' }),
+                h('p', { className: 'dvt_emptyTitle' }, t('missing')),
+                h('p', { className: 'dvt_emptyHint' }, t('missingHint')),
+                missingRoot ? h('p', { className: 'dvt_emptyPath' }, missingRoot) : null,
               )
             : h('ul', { className: 'dvt_level' }, h(Level, { rel: '' })),
         ),
