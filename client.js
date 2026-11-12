@@ -35,6 +35,8 @@ window.__ModuleLoader__.load({
         'config.help': 'Absolute path of the folder this tab lists. Saving re-activates the plugin; the tab shows the new tree after a reload.',
         'config.rootLabel': 'Vault path',
         'config.rootInvalid': 'Enter an absolute path, for example /workspace/Vault',
+        'config.notSet': 'No vault path set',
+        'config.unavailable': 'The configuration entry is not available yet. Reload the page.',
         overridden: 'Overridden',
         reset: 'Reset',
         save: 'Save',
@@ -62,26 +64,11 @@ window.__ModuleLoader__.load({
     const RealFolderOpen = (Prim && Prim.IconFolderOpenRegular) || null;
     const RealRefresh = (Prim && Prim.IconRefreshOutlineRegular) || null;
     const RealTooltip = (Prim && Prim.Tooltip) || null;
-    const SettingsFormModel = (Prim && Prim.SettingsFormModel) || null;
     const SettingsValueField = (Prim && Prim.SettingsValueField) || null;
     const RealButton = (Prim && Prim.Button) || null;
 
-    /** Patch row id whose config this card edits (configForms keys by row id). */
+    /** Patch row id; the config entry keys itself as `<package>#<row id>`. */
     const CONFIG_ROW_ID = 'vault-tab';
-
-    /** Staged text spec for the single root field: absolute path or clear. */
-    const rootSpec = {
-      field: 'root',
-      format: function (value) {
-        return value == null ? '' : String(value);
-      },
-      parse: function (text) {
-        const trimmed = text.trim();
-        if (!trimmed) return { kind: 'clear' };
-        if (trimmed.charAt(0) !== '/') return void 0;
-        return { kind: 'set', value: trimmed };
-      },
-    };
 
     // Copied from the shipped FilesBody CSS (k-1LKG_* → dvt_*, tokens kept).
     const CSS = [
@@ -352,19 +339,51 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Store over the staged config form, rebuilt at each activation. */
-    let cardStore = null;
-
     /**
-     * Config card in the Plugins panel row (plugins.item slot): one staged
-     * SettingsValueField plus save/discard, mounted only while the Host
-     * serves the row's config entry (Config declared in index.js).
+     * Config entry for this bundle's row (`plugins.row.config`, keyed
+     * `<package>#<row id>`). The manager's row page hands us its host-owned
+     * `form` ({state, mutate}); `summary` projects a one-liner, `page`
+     * renders the staged editor for the single root path.
      */
-    function VaultConfigCard(props) {
+    function VaultRowConfig(props) {
+      if (props.view === 'page') return h(VaultConfigPage, props);
+      const state = props.form && props.form.state;
+      const stored = state && state.value && typeof state.value.root === 'string' ? state.value.root : '';
+      return h('span', null, stored || props.t('config.notSet'));
+    }
+
+    /** Staged editor over the owner-provided form: one field, save/discard. */
+    function VaultConfigPage(props) {
       const t = props.t;
-      const snap = React.useSyncExternalStore(cardStore.subscribe, cardStore.getSnapshot);
-      const shell = snap.shell;
-      const field = snap.root;
+      const form = props.form;
+      const state = form && form.state;
+      const ready = !!state && state.status === 'ready';
+      const stored = ready && state.value && typeof state.value.root === 'string' ? state.value.root : '';
+      const [draft, setDraft] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [failed, setFailed] = React.useState(false);
+      if (!ready) return h('p', { className: 'dvt_cfgHelp' }, t('config.unavailable'));
+      const shown = draft === null ? stored : draft;
+      const trimmed = shown.trim();
+      const invalid = trimmed !== '' && trimmed.charAt(0) !== '/';
+      const dirty = trimmed !== stored;
+      function persist(value) {
+        if (busy || invalid || !state.writable) return;
+        setBusy(true);
+        setFailed(false);
+        const op = value === null ? { op: 'unset', path: ['root'] } : { op: 'set', path: ['root'], value: value };
+        Promise.resolve(form.mutate([op], state.revision)).then(
+          function (ok) {
+            if (ok === false) setFailed(true);
+            else setDraft(null);
+            setBusy(false);
+          },
+          function () {
+            setFailed(true);
+            setBusy(false);
+          },
+        );
+      }
       return h(
         'div',
         { className: 'dvt_cfg' },
@@ -376,34 +395,48 @@ window.__ModuleLoader__.load({
           overriddenLabel: t('overridden'),
           resetLabel: t('reset'),
           invalidLabel: t('config.rootInvalid'),
-          text: field.text,
-          overridden: field.overridden,
-          invalid: field.invalid,
-          disabled: !shell.writable || shell.saving,
+          text: shown,
+          overridden: draft !== null,
+          invalid: invalid,
+          disabled: !state.writable || busy,
           onEdit: function (text) {
-            props.edit('root', text);
+            setDraft(text);
           },
           onReset: function () {
-            props.resetField('root');
+            setDraft(null);
           },
         }),
-        shell.dirty
+        dirty
           ? h(
               'div',
               { className: 'dvt_cfgActions' },
               h(
                 RealButton || 'button',
-                { variant: 'primary', disabled: shell.saving || shell.invalid, onClick: props.save },
+                {
+                  variant: 'primary',
+                  disabled: busy || invalid,
+                  onClick: function () {
+                    persist(trimmed === '' ? null : trimmed);
+                  },
+                },
                 t('save'),
               ),
               h(
                 RealButton || 'button',
-                { variant: 'outline', disabled: shell.saving, onClick: props.discard },
+                {
+                  variant: 'outline',
+                  disabled: busy,
+                  onClick: function () {
+                    setDraft(null);
+                  },
+                },
                 t('discard'),
               ),
-              shell.failed ? h('span', { className: 'dvt_cfgFailed' }, t('saveFailed')) : null,
+              failed ? h('span', { className: 'dvt_cfgFailed' }, t('saveFailed')) : null,
             )
-          : null,
+          : failed
+            ? h('p', { className: 'dvt_cfgFailed' }, t('saveFailed'))
+            : null,
       );
     }
 
@@ -454,45 +487,19 @@ window.__ModuleLoader__.load({
             });
           });
         }, 'vault-tab: tab title');
-        // Config card in the Plugins panel. configForms is accessed guarded:
-        // a profile without the settings UI keeps the tab, just no card.
-        let configForms = null;
-        try {
-          configForms = ctx.configForms || null;
-        } catch (err) {
-          configForms = null;
-        }
-        if (configForms && SettingsFormModel && SettingsValueField) {
-          const formModel = new SettingsFormModel(configForms.get(CONFIG_ROW_ID), [rootSpec]);
-          cardStore = formModel.bind(function () {
-            return { shell: formModel.shell(), root: formModel.field('root') };
-          });
+        // Config entry on this bundle's row page in the Plugins panel. The
+        // manager dispatches it by `<package>#<row id>` and passes the
+        // host-owned form; without the primitives the entry simply is not
+        // registered, the rest of the plugin stays intact.
+        if (SettingsValueField) {
           ctx.effect(function () {
-            return function () {
-              if (typeof formModel.dispose === 'function') formModel.dispose();
-            };
-          }, 'vault-tab: config form subscription');
-          ctx.effect(function () {
-            return configForms.whileServed([CONFIG_ROW_ID], function () {
-              return ctx.slots.inject('plugins.item', function () {
-                return ctx.slots.register(
-                  {
-                    name: 'plugins.item',
-                    id: CONFIG_ROW_ID,
-                    order: 10,
-                    label: function () {
-                      return t('config.title');
-                    },
-                    locale: NS,
-                    inject: function () {
-                      return formModel.actions();
-                    },
-                  },
-                  VaultConfigCard,
-                );
-              });
+            return ctx.slots.inject('plugins.row.config', function () {
+              return ctx.slots.register(
+                { name: 'plugins.row.config', key: ID + '#' + CONFIG_ROW_ID, locale: NS },
+                VaultRowConfig,
+              );
             });
-          }, 'vault-tab: config card');
+          }, 'vault-tab: row config');
         }
       },
     };
