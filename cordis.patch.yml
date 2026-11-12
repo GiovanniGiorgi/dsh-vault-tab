@@ -1,5 +1,3 @@
 - insert:
     - id: vault-tab
       name: '@local/dsh-vault-tab'
-      config:
-        root: /workspace/Vault

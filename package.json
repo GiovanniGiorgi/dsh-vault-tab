@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-vault-tab",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault); file clicks open the built-in Document preview",

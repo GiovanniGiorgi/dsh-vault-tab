@@ -1,9 +1,12 @@
 // Host half of @local/dsh-vault-tab: one exact JSON route listing one level of
-// the configured root. The root is pinned in the patch row's config; any
-// requested path is resolved and must stay under it. File previews do not go
-// through this route: the Client opens the built-in Document viewer, whose
-// reads follow the Session's own file-read authority.
+// the configured root. An unset root falls back to `<home>/Vault`, so a fresh
+// install works out of the box; a missing root folder is reported as
+// `{ root, missing: true }` and the Client shows where to reconfigure. Any
+// requested path is resolved and must stay under the root. File previews do
+// not go through this route: the Client opens the built-in Document viewer,
+// whose reads follow the Session's own file-read authority.
 import { readdir } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import z from '@deepseek-ai/schemastery';
 
@@ -11,21 +14,30 @@ export const inject = ['webServer'];
 
 /**
  * The row's config. `root` is editable from the plugin's card in the Plugins
- * panel (configForms writes it into the profile patch and Loader re-activates
- * this row, so the route re-registers with the new value). An empty root keeps
- * the tab registered but inert; the Client shows a hint instead of a tree.
+ * panel (configForms writes it into the profile patch; the field is volatile,
+ * so the next listing already uses the new value). Empty means the default
+ * `<home>/Vault`; `~` in a configured path expands to the home directory.
  */
 export const Config = z.object({
 	root: z
 		.string()
 		.default('')
-		.description('Absolute path of the folder the Vault tab lists (empty: unset).')
+		.description('Absolute path of the folder the Vault tab lists (empty: <home>/Vault).')
 		.volatile(),
 });
 
 /** Volatile fields arrive as `{ get() }` references; plain values pass through. */
 function currentValue(value) {
 	return value && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value;
+}
+
+/** Effective listing root: configured path (with `~` support) or `<home>/Vault`. */
+function resolveRoot(raw) {
+	const value = typeof raw === 'string' ? raw.trim() : '';
+	if (!value) return path.join(os.homedir(), 'Vault');
+	if (value === '~') return os.homedir();
+	if (value.startsWith('~/') || value.startsWith('~\\')) return path.join(os.homedir(), value.slice(2));
+	return path.resolve(value);
 }
 
 /** Entries reported per level before the list is cut, mirroring the workspace file cap. */
@@ -41,9 +53,7 @@ export function apply(ctx, config) {
 		if (req.method !== 'GET') return json(res, 405, { error: 'method-not-allowed' });
 		// Resolved per request: saving the card swaps the volatile reference
 		// value without re-activating this row, and the listing follows.
-		const raw = currentValue(config && config.root);
-		const root = typeof raw === 'string' && raw ? path.resolve(raw) : '';
-		if (!root) return json(res, 200, { root: '', entries: [], truncated: false });
+		const root = resolveRoot(currentValue(config && config.root));
 		// Same-site guard that survives the Caddy rewrite of Host/Origin: the
 		// browser's own Sec-Fetch-Site is the authoritative hint when present.
 		const site = req.headers['sec-fetch-site'];
@@ -56,6 +66,11 @@ export function apply(ctx, config) {
 		try {
 			dirents = await readdir(target, { withFileTypes: true });
 		} catch (err) {
+			// A missing configured root is a state to explain, not an error:
+			// the Client renders "folder not found + where to configure it".
+			if (rel === '' && err && (err.code === 'ENOENT' || err.code === 'ENOTDIR' || err.code === 'EACCES')) {
+				return json(res, 200, { root, entries: [], missing: true, truncated: false });
+			}
 			const code = err && err.code === 'ENOENT' ? 404 : err && err.code === 'ENOTDIR' ? 400 : 500;
 			return json(res, code, { error: 'unreadable' });
 		}

@@ -30,9 +30,10 @@ window.__ModuleLoader__.load({
         failed: 'Cannot read this folder',
         empty: 'Empty folder',
         other: 'Not a file or directory',
-        noRoot: 'No vault path set. Choose one in Plugins → Vault Tab.',
+        missing: 'Vault folder not found: {path}',
+        missingHint: 'Pick your folder in Plugins → Vault Tab (field “Vault path”), or create this one.',
         'config.title': 'Vault',
-        'config.help': 'Absolute path of the folder this tab lists. Saving applies immediately; press Reload in the Vault tab to see the new tree.',
+        'config.help': 'Absolute path of the folder this tab lists (empty: a Vault folder in the server home). Saving applies immediately; press Reload in the Vault tab to see the new tree.',
         'config.rootLabel': 'Vault path',
         'config.rootInvalid': 'Enter an absolute path, for example /workspace/Vault',
         'config.notSet': 'No vault path set',
@@ -174,7 +175,7 @@ window.__ModuleLoader__.load({
       const [root, setRoot] = React.useState('');
       const [levels, setLevels] = React.useState({});
       const [expanded, setExpanded] = React.useState({});
-      const [unset, setUnset] = React.useState(false);
+      const [missingRoot, setMissingRoot] = React.useState(null);
       const alive = React.useRef(true);
       React.useEffect(function () {
         return function () {
@@ -198,7 +199,7 @@ window.__ModuleLoader__.load({
           })
           .then(function (data) {
             if (!alive.current) return;
-            setUnset(data.root === '');
+            setMissingRoot(data.missing ? data.root || '' : null);
             if (data.root) setRoot(data.root);
             writeLevel(rel, { state: 'ready', entries: data.entries || [], truncated: !!data.truncated });
           })
@@ -347,8 +348,13 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dvt_body' },
-          unset
-            ? h('ul', { className: 'dvt_level' }, h('li', { className: 'dvt_note' }, t('noRoot')))
+          missingRoot !== null
+            ? h(
+                'ul',
+                { className: 'dvt_level' },
+                h('li', { className: 'dvt_note' }, t('missing', { path: missingRoot || '?' })),
+                h('li', { className: 'dvt_note' }, t('missingHint')),
+              )
             : h('ul', { className: 'dvt_level' }, h(Level, { rel: '' })),
         ),
       );
