@@ -412,7 +412,10 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'sidebarRightTabs'],
+      // configForms is a real dependency here: an undeclared ctx access does
+      // not resolve in the browser fiber. It ships with the GUI settings
+      // stack; the client half only runs in a GUI profile anyway.
+      inject: ['slots', 'locale', 'sidebarRightTabs', 'configForms'],
       apply(ctx) {
         const t = ctx.locale.bind(NS);
         ctx.effect(function () {
