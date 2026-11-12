@@ -32,7 +32,7 @@ window.__ModuleLoader__.load({
         other: 'Not a file or directory',
         noRoot: 'No vault path set. Choose one in Plugins → Vault Tab.',
         'config.title': 'Vault',
-        'config.help': 'Absolute path of the folder this tab lists. Saving re-activates the plugin; the tab shows the new tree after a reload.',
+        'config.help': 'Absolute path of the folder this tab lists. Saving applies immediately; press Reload in the Vault tab to see the new tree.',
         'config.rootLabel': 'Vault path',
         'config.rootInvalid': 'Enter an absolute path, for example /workspace/Vault',
         'config.notSet': 'No vault path set',

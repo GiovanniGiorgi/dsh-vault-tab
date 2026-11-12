@@ -19,8 +19,14 @@ export const Config = z.object({
 	root: z
 		.string()
 		.default('')
-		.description('Absolute path of the folder the Vault tab lists (empty: unset).'),
+		.description('Absolute path of the folder the Vault tab lists (empty: unset).')
+		.volatile(),
 });
+
+/** Volatile fields arrive as `{ get() }` references; plain values pass through. */
+function currentValue(value) {
+	return value && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value;
+}
 
 /** Entries reported per level before the list is cut, mirroring the workspace file cap. */
 const MAX_ENTRIES = 1000;
@@ -31,10 +37,12 @@ function json(res, code, body) {
 }
 
 export function apply(ctx, config) {
-	const raw = config && typeof config.root === 'string' ? config.root : '';
-	const root = raw ? path.resolve(raw) : '';
 	const handler = async (req, res) => {
 		if (req.method !== 'GET') return json(res, 405, { error: 'method-not-allowed' });
+		// Resolved per request: saving the card swaps the volatile reference
+		// value without re-activating this row, and the listing follows.
+		const raw = currentValue(config && config.root);
+		const root = typeof raw === 'string' && raw ? path.resolve(raw) : '';
 		if (!root) return json(res, 200, { root: '', entries: [], truncated: false });
 		// Same-site guard that survives the Caddy rewrite of Host/Origin: the
 		// browser's own Sec-Fetch-Site is the authoritative hint when present.
