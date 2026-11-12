@@ -1,0 +1,22 @@
+{
+  "name": "@local/dsh-vault-tab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault); file clicks open the built-in Document preview",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"]
+    }
+  }
+}
