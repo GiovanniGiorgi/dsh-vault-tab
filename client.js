@@ -7,9 +7,11 @@
 // FilesBody): rows are <button>.row inside <li>, levels nest as <ul> with an
 // 18px left padding, header is 38px with a PathLabel-like root and the shared
 // 28px tool button. Class names are renamed under the plugin prefix; only
-// --dsw-alias-* / --dsh-* tokens are shared. The per-extension FileTypeIcon
-// coloring is a primitives-internal system that cannot be imported, so files
-// draw a neutral sheet glyph here.
+// --dsw-alias-* / --dsh-* tokens are shared. Header path, folder icons, the
+// refresh glyph and the per-extension FileTypeIcon coloring come from the
+// shared primitives module when it resolves (see the Prim block), falling
+// back to copied replicas. The Plugins-panel config card edits the row's
+// config.root through configForms, the same path the built-in cards use.
 window.__ModuleLoader__.load({
   id: '@local/dsh-vault-tab',
   factory(require) {
@@ -28,6 +30,16 @@ window.__ModuleLoader__.load({
         failed: 'Cannot read this folder',
         empty: 'Empty folder',
         other: 'Not a file or directory',
+        noRoot: 'No vault path set. Choose one in Plugins → Vault Tab.',
+        'config.title': 'Vault',
+        'config.help': 'Absolute path of the folder this tab lists. Saving re-activates the plugin; the tab shows the new tree after a reload.',
+        'config.rootLabel': 'Vault path',
+        'config.rootInvalid': 'Enter an absolute path, for example /workspace/Vault',
+        overridden: 'Overridden',
+        reset: 'Reset',
+        save: 'Save',
+        discard: 'Discard',
+        saveFailed: 'Saving failed. Try again.',
       },
     };
 
@@ -50,6 +62,26 @@ window.__ModuleLoader__.load({
     const RealFolderOpen = (Prim && Prim.IconFolderOpenRegular) || null;
     const RealRefresh = (Prim && Prim.IconRefreshOutlineRegular) || null;
     const RealTooltip = (Prim && Prim.Tooltip) || null;
+    const SettingsFormModel = (Prim && Prim.SettingsFormModel) || null;
+    const SettingsValueField = (Prim && Prim.SettingsValueField) || null;
+    const RealButton = (Prim && Prim.Button) || null;
+
+    /** Patch row id whose config this card edits (configForms keys by row id). */
+    const CONFIG_ROW_ID = 'vault-tab';
+
+    /** Staged text spec for the single root field: absolute path or clear. */
+    const rootSpec = {
+      field: 'root',
+      format: function (value) {
+        return value == null ? '' : String(value);
+      },
+      parse: function (text) {
+        const trimmed = text.trim();
+        if (!trimmed) return { kind: 'clear' };
+        if (trimmed.charAt(0) !== '/') return void 0;
+        return { kind: 'set', value: trimmed };
+      },
+    };
 
     // Copied from the shipped FilesBody CSS (k-1LKG_* → dvt_*, tokens kept).
     const CSS = [
@@ -76,6 +108,10 @@ window.__ModuleLoader__.load({
       '.dvt_tool{width:28px;height:28px;color:var(--dsw-alias-label-secondary);border-radius:var(--dsw-radius-sm);cursor:pointer;background:0 0;border:none;flex:none;justify-content:center;align-items:center;padding:6px;line-height:1;display:inline-flex}',
       '.dvt_tool svg{width:15px;height:15px}',
       '.dvt_tool:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dvt_cfg{gap:10px;max-width:520px;display:flex;flex-direction:column}',
+      '.dvt_cfgHelp{color:var(--dsw-alias-label-secondary);font-size:var(--dsh-content-font-size-secondary,13px);margin:0;line-height:1.6}',
+      '.dvt_cfgActions{align-items:center;gap:8px;display:flex}',
+      '.dvt_cfgFailed{color:var(--dsw-alias-status-danger, #d33);font-size:12px}',
       '.dvt_titleIcon{flex:none}',
     ].join('\n');
 
@@ -136,6 +172,7 @@ window.__ModuleLoader__.load({
       const [root, setRoot] = React.useState('');
       const [levels, setLevels] = React.useState({});
       const [expanded, setExpanded] = React.useState({});
+      const [unset, setUnset] = React.useState(false);
       const alive = React.useRef(true);
       React.useEffect(function () {
         return function () {
@@ -159,6 +196,7 @@ window.__ModuleLoader__.load({
           })
           .then(function (data) {
             if (!alive.current) return;
+            setUnset(data.root === '');
             if (data.root) setRoot(data.root);
             writeLevel(rel, { state: 'ready', entries: data.entries || [], truncated: !!data.truncated });
           })
@@ -304,7 +342,68 @@ window.__ModuleLoader__.load({
             : h('span', { className: 'dvt_path', title: root }, root ? '\u202D' + root + '\u202C' : ''),
           reloadControl,
         ),
-        h('div', { className: 'dvt_body' }, h('ul', { className: 'dvt_level' }, h(Level, { rel: '' }))),
+        h(
+          'div',
+          { className: 'dvt_body' },
+          unset
+            ? h('ul', { className: 'dvt_level' }, h('li', { className: 'dvt_note' }, t('noRoot')))
+            : h('ul', { className: 'dvt_level' }, h(Level, { rel: '' })),
+        ),
+      );
+    }
+
+    /** Store over the staged config form, rebuilt at each activation. */
+    let cardStore = null;
+
+    /**
+     * Config card in the Plugins panel row (plugins.item slot): one staged
+     * SettingsValueField plus save/discard, mounted only while the Host
+     * serves the row's config entry (Config declared in index.js).
+     */
+    function VaultConfigCard(props) {
+      const t = props.t;
+      const snap = React.useSyncExternalStore(cardStore.subscribe, cardStore.getSnapshot);
+      const shell = snap.shell;
+      const field = snap.root;
+      return h(
+        'div',
+        { className: 'dvt_cfg' },
+        h('style', null, CSS),
+        h('p', { className: 'dvt_cfgHelp' }, t('config.help')),
+        h(SettingsValueField, {
+          id: 'plugin-config-vault-root',
+          label: t('config.rootLabel'),
+          overriddenLabel: t('overridden'),
+          resetLabel: t('reset'),
+          invalidLabel: t('config.rootInvalid'),
+          text: field.text,
+          overridden: field.overridden,
+          invalid: field.invalid,
+          disabled: !shell.writable || shell.saving,
+          onEdit: function (text) {
+            props.edit('root', text);
+          },
+          onReset: function () {
+            props.resetField('root');
+          },
+        }),
+        shell.dirty
+          ? h(
+              'div',
+              { className: 'dvt_cfgActions' },
+              h(
+                RealButton || 'button',
+                { variant: 'primary', disabled: shell.saving || shell.invalid, onClick: props.save },
+                t('save'),
+              ),
+              h(
+                RealButton || 'button',
+                { variant: 'outline', disabled: shell.saving, onClick: props.discard },
+                t('discard'),
+              ),
+              shell.failed ? h('span', { className: 'dvt_cfgFailed' }, t('saveFailed')) : null,
+            )
+          : null,
       );
     }
 
@@ -355,6 +454,46 @@ window.__ModuleLoader__.load({
             });
           });
         }, 'vault-tab: tab title');
+        // Config card in the Plugins panel. configForms is accessed guarded:
+        // a profile without the settings UI keeps the tab, just no card.
+        let configForms = null;
+        try {
+          configForms = ctx.configForms || null;
+        } catch (err) {
+          configForms = null;
+        }
+        if (configForms && SettingsFormModel && SettingsValueField) {
+          const formModel = new SettingsFormModel(configForms.get(CONFIG_ROW_ID), [rootSpec]);
+          cardStore = formModel.bind(function () {
+            return { shell: formModel.shell(), root: formModel.field('root') };
+          });
+          ctx.effect(function () {
+            return function () {
+              if (typeof formModel.dispose === 'function') formModel.dispose();
+            };
+          }, 'vault-tab: config form subscription');
+          ctx.effect(function () {
+            return configForms.whileServed([CONFIG_ROW_ID], function () {
+              return ctx.slots.inject('plugins.item', function () {
+                return ctx.slots.register(
+                  {
+                    name: 'plugins.item',
+                    id: CONFIG_ROW_ID,
+                    order: 10,
+                    label: function () {
+                      return t('config.title');
+                    },
+                    locale: NS,
+                    inject: function () {
+                      return formModel.actions();
+                    },
+                  },
+                  VaultConfigCard,
+                );
+              });
+            });
+          }, 'vault-tab: config card');
+        }
       },
     };
   },

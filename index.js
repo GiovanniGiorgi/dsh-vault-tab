@@ -5,8 +5,22 @@
 // reads follow the Session's own file-read authority.
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
+import z from '@deepseek-ai/schemastery';
 
 export const inject = ['webServer'];
+
+/**
+ * The row's config. `root` is editable from the plugin's card in the Plugins
+ * panel (configForms writes it into the profile patch and Loader re-activates
+ * this row, so the route re-registers with the new value). An empty root keeps
+ * the tab registered but inert; the Client shows a hint instead of a tree.
+ */
+export const Config = z.object({
+	root: z
+		.string()
+		.default('')
+		.description('Absolute path of the folder the Vault tab lists (empty: unset).'),
+});
 
 /** Entries reported per level before the list is cut, mirroring the workspace file cap. */
 const MAX_ENTRIES = 1000;
@@ -18,10 +32,10 @@ function json(res, code, body) {
 
 export function apply(ctx, config) {
 	const raw = config && typeof config.root === 'string' ? config.root : '';
-	if (!raw) throw new Error('@local/dsh-vault-tab: config.root is required (absolute path of the extra file tree)');
-	const root = path.resolve(raw);
+	const root = raw ? path.resolve(raw) : '';
 	const handler = async (req, res) => {
 		if (req.method !== 'GET') return json(res, 405, { error: 'method-not-allowed' });
+		if (!root) return json(res, 200, { root: '', entries: [], truncated: false });
 		// Same-site guard that survives the Caddy rewrite of Host/Origin: the
 		// browser's own Sec-Fetch-Site is the authoritative hint when present.
 		const site = req.headers['sec-fetch-site'];
