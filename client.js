@@ -31,11 +31,32 @@ window.__ModuleLoader__.load({
       },
     };
 
+    // Host shared components. The browser module table registers
+    // '@deepseek-ai/dsh-client-ui-primitives' as a static module (the very
+    // instance shipped bundles import), so require resolves here too. It is
+    // still an internal dependency that changes without notice across
+    // upgrades: every use is guarded and falls back to the copied replicas
+    // below, so a renamed primitive degrades the look, never the tab.
+    let Prim = null;
+    try {
+      Prim = require('@deepseek-ai/dsh-client-ui-primitives');
+    } catch (err) {
+      Prim = null;
+    }
+    const PathLabel = (Prim && Prim.PathLabel) || null;
+    const FileTypeIcon = (Prim && Prim.FileTypeIcon) || null;
+    const classifyFileType = (Prim && Prim.classifyFileType) || null;
+    const RealFolderClose = (Prim && Prim.IconFolderCloseRegular) || null;
+    const RealFolderOpen = (Prim && Prim.IconFolderOpenRegular) || null;
+    const RealRefresh = (Prim && Prim.IconRefreshOutlineRegular) || null;
+    const RealTooltip = (Prim && Prim.Tooltip) || null;
+
     // Copied from the shipped FilesBody CSS (k-1LKG_* → dvt_*, tokens kept).
     const CSS = [
       '.dvt_root{height:100%;min-height:0;color:var(--dsw-alias-label-primary);font-size:var(--dsh-content-font-size-secondary,13px);flex-direction:column;flex:auto;line-height:1.5;display:flex}',
       '.dvt_header{box-sizing:border-box;border-bottom:.5px solid var(--dsw-alias-border-l3);flex:none;align-items:center;gap:4px;height:38px;padding:0 6px 0 16px;display:flex}',
       '.dvt_path{margin-right:12px;min-width:0;direction:rtl;text-align:left;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;unicode-bidi:isolate}',
+      '.dvt_pathHost{margin-right:12px}',
       '.dvt_body{scrollbar-gutter:stable;flex:auto;min-height:0;margin-right:2px;padding:8px 0 8px 8px;overflow:auto}',
       '.dvt_body::-webkit-scrollbar-track{margin:2px}',
       '.dvt_level{margin:0;padding:0;list-style:none}',
@@ -44,7 +65,8 @@ window.__ModuleLoader__.load({
       '.dvt_row{width:100%;min-width:0;color:inherit;font:inherit;text-align:left;border-radius:var(--dsw-radius-md);cursor:pointer;background:0 0;border:0;align-items:center;gap:6px;padding:5px 10px;display:flex}',
       '.dvt_row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.dvt_icon{color:var(--dsw-alias-label-tertiary);flex:none}',
-      '.dvt_fileIcon{color:var(--dsw-alias-label-secondary);flex:none}',
+      '.dvt_fileIcon{flex:none}',
+      '.dvt_sheet{color:var(--dsw-alias-label-secondary);flex:none}',
       '.dvt_name{white-space:nowrap;text-overflow:ellipsis;min-width:0;overflow:hidden}',
       '.dvt_other{color:var(--dsw-alias-label-tertiary);cursor:default}',
       '.dvt_other:hover{background:0 0}',
@@ -197,7 +219,7 @@ window.__ModuleLoader__.load({
                   toggle(entry.path);
                 },
               },
-              isOpen ? h(FolderOpen, { className: 'dvt_icon' }) : h(FolderClose, { className: 'dvt_icon' }),
+              h(isOpen ? RealFolderOpen || FolderOpen : RealFolderClose || FolderClose, { className: 'dvt_icon' }),
               h('span', { className: 'dvt_name' }, entry.name),
             ),
             isOpen
@@ -218,7 +240,9 @@ window.__ModuleLoader__.load({
                   openFile(entry.path);
                 },
               },
-              h(FileSheet, { className: 'dvt_fileIcon' }),
+              FileTypeIcon && classifyFileType
+                ? h(FileTypeIcon, { kind: classifyFileType(entry.name), size: 16, className: 'dvt_fileIcon' })
+                : h(FileSheet, { className: 'dvt_sheet' }),
               h('span', { className: 'dvt_name' }, entry.name),
             ),
           );
@@ -248,6 +272,25 @@ window.__ModuleLoader__.load({
         ];
       }
 
+      const refreshButton = h(
+        'button',
+        { type: 'button', className: 'dvt_tool', 'aria-label': t('reload'), title: t('reload'), onClick: reload },
+        h(RealRefresh || IconRefresh, null),
+      );
+      // Host header wraps reload in a Tooltip (label + shortcut keys).
+      const reloadControl = RealTooltip
+        ? h(
+            RealTooltip,
+            {
+              label: t('reload'),
+              shortcutKeys: tabInfo.tab.refreshShortcut && tabInfo.tab.refreshShortcut.keys,
+              side: 'bottom',
+              delayMs: 500,
+            },
+            refreshButton,
+          )
+        : refreshButton;
+
       return h(
         'div',
         { className: 'dvt_root' },
@@ -255,13 +298,11 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dvt_header' },
-          // PathLabel replica: full path kept, clipped at the leading end.
-          h('span', { className: 'dvt_path', title: root, 'data-files-path': true }, root ? '\u202D' + root + '\u202C' : ''),
-          h(
-            'button',
-            { type: 'button', className: 'dvt_tool', 'aria-label': t('reload'), title: t('reload'), onClick: reload },
-            h(IconRefresh, null),
-          ),
+          // PathLabel reale quando le primitives rispondono; altrimenti la replica.
+          PathLabel
+            ? h(PathLabel, { path: root, className: 'dvt_pathHost', 'data-files-path': true })
+            : h('span', { className: 'dvt_path', title: root }, root ? '\u202D' + root + '\u202C' : ''),
+          reloadControl,
         ),
         h('div', { className: 'dvt_body' }, h('ul', { className: 'dvt_level' }, h(Level, { rel: '' }))),
       );
