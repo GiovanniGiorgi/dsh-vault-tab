@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Vault Tab",
-    "description": "Adds a right-sidebar tab with a second file tree rooted at a configured folder (default: a Vault folder in the server home). Clicking a file opens the built-in preview. A Host route serves the listing, pinned under the configured root."
+    "description": "Adds a right-sidebar tab with a second file tree rooted at a configured folder (default: a Vault folder in the server home). Clicking a file opens the built-in preview. A Host route serves the listing, pinned under the configured root. An optional vault-setup skill creates or adopts that folder; switch it off once the vault exists."
   }
 }

@@ -36,6 +36,8 @@ window.__ModuleLoader__.load({
         'config.help': 'Absolute path of the folder this tab lists (empty: a Vault folder in the server home). Saving applies immediately; press Reload in the Vault tab to see the new tree.',
         'config.rootLabel': 'Vault path',
         'config.rootInvalid': 'Enter an absolute path, for example /workspace/Vault',
+        'config.skillLabel': 'Vault setup skill',
+        'config.skillHelp': 'Lets an AI create or adopt the vault folder with the vault_setup tool, guided by the vault-setup skill. Switch it off once the vault is set up: while on, it adds context to every session.',
         'config.notSet': 'No vault path set',
         'config.unavailable': 'The configuration entry is not available yet. Reload the page.',
         overridden: 'Overridden',
@@ -86,6 +88,22 @@ window.__ModuleLoader__.load({
       },
     };
 
+    /**
+     * Staged spec for the setup-skill flag. The switch writes the two literals
+     * 'on'/'off' through the same edit channel as the path field, so the Save /
+     * Discard row stays the single commit point; only 'off' differs from the
+     * default, and Reset restores the enabled skill.
+     */
+    const skillSpec = {
+      field: 'skillSetup',
+      format: function (value) {
+        return value === false ? 'off' : 'on';
+      },
+      parse: function (text) {
+        return { kind: 'set', value: String(text).trim().toLowerCase() !== 'off' };
+      },
+    };
+
     // Copied from the shipped FilesBody CSS (k-1LKG_* → dvt_*, tokens kept).
     const CSS = [
       '.dvt_root{height:100%;min-height:0;color:var(--dsw-alias-label-primary);font-size:var(--dsh-content-font-size-secondary,13px);flex-direction:column;flex:auto;line-height:1.5;display:flex}',
@@ -121,6 +139,16 @@ window.__ModuleLoader__.load({
       '.dvt_cfgActions{align-items:center;gap:8px;display:flex}',
       '.dvt_cfgFailed{color:var(--dsw-alias-status-danger, #d33);font-size:12px}',
       '.dvt_titleIcon{flex:none}',
+      '.dvt_switchRow{align-items:flex-start;gap:10px;display:flex}',
+      '.dvt_switch{width:36px;height:20px;border-radius:10px;cursor:pointer;border:0;flex:none;padding:0;position:relative;background:var(--dsw-alias-state-idle-primary,#8e8e93)}',
+      '.dvt_switch:disabled{cursor:default;opacity:.5}',
+      '.dvt_switchOn{background:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.dvt_switchKnob{width:16px;height:16px;border-radius:50%;display:block;background:var(--dsw-alias-bg-overlay,#fff);top:2px;left:2px;position:absolute;transition:left .12s ease-out}',
+      '.dvt_switchOn .dvt_switchKnob{left:18px}',
+      '.dvt_switchText{min-width:0;flex-direction:column;gap:2px;display:flex}',
+      '.dvt_switchHead{align-items:center;gap:6px;display:flex}',
+      '.dvt_switchLabel{color:var(--dsw-alias-label-primary);font-size:var(--dsh-content-font-size-secondary,13px)}',
+      '.dvt_switchTag{color:var(--dsw-alias-label-tertiary);font-size:11px}',
     ].join('\n');
 
     const SVG = { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true };
@@ -382,6 +410,8 @@ window.__ModuleLoader__.load({
       const snap = React.useSyncExternalStore(cardStore.subscribe, cardStore.getSnapshot);
       const shell = snap.shell;
       const field = snap.root;
+      // The Host row supplies this field; a stale schema still renders a switch.
+      const skillField = snap.skill || { text: 'on', overridden: false, invalid: false };
       return h(
         'div',
         { className: 'dvt_cfg' },
@@ -404,6 +434,36 @@ window.__ModuleLoader__.load({
             props.resetField('root');
           },
         }),
+        h(
+          'div',
+          { className: 'dvt_switchRow' },
+          h(
+            'button',
+            {
+              id: 'plugin-config-vault-skill',
+              type: 'button',
+              role: 'switch',
+              'aria-checked': skillField.text === 'off' ? 'false' : 'true',
+              className: 'dvt_switch' + (skillField.text === 'off' ? '' : ' dvt_switchOn'),
+              disabled: !shell.writable || shell.saving,
+              onClick: function () {
+                props.edit('skillSetup', skillField.text === 'off' ? 'on' : 'off');
+              },
+            },
+            h('span', { className: 'dvt_switchKnob' }),
+          ),
+          h(
+            'span',
+            { className: 'dvt_switchText' },
+            h(
+              'span',
+              { className: 'dvt_switchHead' },
+              h('span', { className: 'dvt_switchLabel' }, t('config.skillLabel')),
+              skillField.overridden ? h('span', { className: 'dvt_switchTag' }, t('overridden')) : null,
+            ),
+            h('p', { className: 'dvt_cfgHelp' }, t('config.skillHelp')),
+          ),
+        ),
         shell.dirty
           ? h(
               'div',
@@ -485,9 +545,9 @@ window.__ModuleLoader__.load({
           configForms = null;
         }
         if (configForms && SettingsFormModel && SettingsValueField) {
-          const formModel = new SettingsFormModel(configForms.get(CONFIG_ROW_ID), [rootSpec]);
+          const formModel = new SettingsFormModel(configForms.get(CONFIG_ROW_ID), [rootSpec, skillSpec]);
           cardStore = formModel.bind(function () {
-            return { shell: formModel.shell(), root: formModel.field('root') };
+            return { shell: formModel.shell(), root: formModel.field('root'), skill: formModel.field('skillSetup') };
           });
           ctx.effect(function () {
             return function () {
