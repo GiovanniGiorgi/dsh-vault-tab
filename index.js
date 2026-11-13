@@ -18,7 +18,7 @@
 //    single place where the vault boundary is decided; the skill only explains
 //    the order of operations, and the user is asked before anything is written.
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -84,6 +84,16 @@ export const Config = z.object({
 		.default(true)
 		.description('Register the vault-setup skill, which scaffolds or adopts a vault folder through the vault_setup tool.')
 		.volatile(),
+	writeRoot: z
+		.string()
+		.default('')
+		.description('Absolute path the vault_write tool may write (empty: the Vault path above). Reading never needs this.')
+		.volatile(),
+	vaultGrantDefault: z
+		.boolean()
+		.default(false)
+		.description('Start a session under Workspace Write with the Vault Grant on. Read Only never writes, Full access always does.')
+		.volatile(),
 });
 
 /** Volatile fields arrive as `{ get() }` references; plain values pass through. */
@@ -130,6 +140,76 @@ async function probe(target) {
 	} catch (error) {
 		if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return { exists: false, directory: false };
 		throw error;
+	}
+}
+
+// --- Vault write -------------------------------------------------------------
+//
+// The grant lives here, in memory, keyed by session. It is NOT a session event:
+// a plugin cannot append a new event type and reopen the log afterwards, and
+// `appendPluginRecord` is reserved for DSH's own experimental packages. So the
+// decision of the user lives as long as the session lives in this Host process,
+// and a restart returns to `Config.vaultGrantDefault`.
+
+/** Sessions whose Vault Grant the user decided by hand, by session id. */
+const grants = new Map();
+
+/** Largest content one `vault_write` accepts. */
+const MAX_WRITE_BYTES = 1 << 20;
+
+/** Starting grant of a session that never toggled it. */
+function grantDefault(config) {
+	return currentValue(config && config.vaultGrantDefault) === true;
+}
+
+/** Effective write root: the configured one, else the (defaulted) read root. */
+function writeRootOf(config) {
+	return absolutePath(currentValue(config && config.writeRoot)) || resolveRoot(currentValue(config && config.root));
+}
+
+/**
+ * The one resolver of "may this session write to the vault", shared by the tool,
+ * the command and the composer chip so the control can never disagree with the
+ * enforcement. The sandbox mode decides; the stored choice only matters under
+ * `workspace-write`, which is the one regime where this adds a capability.
+ */
+function grantState(ctx, session, fallback) {
+	const policy = ctx.get('sandboxPolicy');
+	const mode = policy ? policy.resolve({ session }).mode : void 0;
+	if (mode === 'danger-full-access') return { mode, allowed: true, editable: false };
+	if (mode !== 'workspace-write') return { mode, allowed: false, editable: false };
+	if (grants.has(session.header.id)) return { mode, allowed: grants.get(session.header.id), editable: true };
+	// A fork inherits the parent's decision; a delegated child never does — the
+	// two are told apart by `origin`, which only a subagent sets.
+	const parent = session.header.parentSession;
+	const inherited = parent && session.header.origin !== 'subagent' && grants.has(parent) ? grants.get(parent) : fallback;
+	return { mode, allowed: inherited, editable: true };
+}
+
+/**
+ * Resolve `rel` under `root` and prove containment on CANONICAL paths: the
+ * lexical test rejects the obvious escapes, then the deepest existing ancestor
+ * is realpath'd so a symlinked folder cannot carry the target outside, and only
+ * then is the missing suffix re-joined. Returns `{ target }` or `{ error }`.
+ */
+async function confinePath(root, rel) {
+	const clean = String(rel ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
+	if (!clean || clean.split('/').some((part) => part === '' || part === '.' || part === '..')) return { error: 'invalid-path' };
+	const lexical = path.resolve(root, clean);
+	if (lexical !== root && !lexical.startsWith(root + path.sep)) return { error: 'outside-root' };
+	const base = await realpath(root).catch(() => root);
+	let cursor = lexical;
+	const suffix = [];
+	for (;;) {
+		const resolved = await realpath(cursor).catch(() => void 0);
+		if (resolved !== void 0) {
+			const target = suffix.length ? path.join(resolved, ...suffix.reverse()) : resolved;
+			return target === base || target.startsWith(base + path.sep) ? { target } : { error: 'outside-root' };
+		}
+		const parent = path.dirname(cursor);
+		if (parent === cursor) return { error: 'unresolvable' };
+		suffix.push(path.basename(cursor));
+		cursor = parent;
 	}
 }
 
@@ -358,6 +438,134 @@ const SKILL_NAME = 'vault-setup';
 const SKILL_DESCRIPTION = 'Create or adopt the vault folder that the Vault Tab plugin lists: check the configured path, seed the PARA structure, write the root POLICY.md.';
 const SKILL_WHEN_TO_USE = 'Use when the vault path is missing, empty or not yet trusted, or when the user asks to set up, initialise, adopt, move or re-check a vault folder.';
 
+const NOTE_SKILL_NAME = 'vault-note';
+const NOTE_SKILL_DESCRIPTION = 'Save a note into the vault folder with the vault_write tool of the Vault Tab plugin, under the Vault Grant the user decides in the composer.';
+const NOTE_SKILL_WHEN_TO_USE = 'Use when the user asks to save, jot down or file something in the vault, outside the current workspace.';
+
+/** Model-facing contract of the write tool; short because it is read on every request. */
+const WRITE_TOOL_DESCRIPTION =
+	'Write one UTF-8 file inside the vault folder configured in the Vault Tab plugin. Plugin Host code performs ' +
+	'the write, so it also works while the Session is workspace-write, where the Session’s own write, edit and ' +
+	'bash tools are denied outside its workspace. The path is relative to the vault root and cannot leave it. ' +
+	'Writing needs the user’s Vault Grant, decided in the composer beside the permission selector: when the ' +
+	'tool reports the grant is off or the Session is read-only, tell the user instead of retrying, and never ' +
+	'fall back to bash or the native write. Reading the vault needs no grant and works with the usual tools.';
+
+function writeTool(ctx, config) {
+	return {
+		name: 'vault_write',
+		description: WRITE_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				path: { type: 'string', description: 'File inside the vault root, relative to it, for example 30-Resources/nota.md.' },
+				content: { type: 'string', description: 'Complete new content of the file, UTF-8 text.' },
+				overwrite: { type: 'boolean', description: 'True replaces an existing file: read it first, then pass the whole new content.' },
+			},
+			required: ['path', 'content'],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					path: { type: 'string', description: 'Written path, relative to the vault root.' },
+					bytes: { type: 'integer', description: 'Bytes written.' },
+					action: { type: 'string', enum: ['created', 'replaced'], description: 'Whether the file already existed.' },
+					root: { type: 'string', description: 'Absolute vault root the path is under.' },
+					error: { type: 'string', description: 'Refusal reason, when nothing was written.' },
+					hint: { type: 'string', description: 'What to do instead, when nothing was written.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [
+				{
+					type: 'text',
+					text: value.error
+						? `vault_write refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
+						: `vault_write ${value.action} ${value.path} (${value.bytes} bytes)`,
+				},
+			],
+		},
+		// Two writes on one file cannot be ordered, and the tool is the boundary.
+		isConcurrencySafe: () => false,
+		async execute(args, exec) {
+			const agent = exec.agent;
+			if (!agent) return { error: 'no-session', hint: 'vault_write only runs for a live session, whose user decides the grant.' };
+			const root = writeRootOf(config);
+			const state = grantState(ctx, agent.session, grantDefault(config));
+			if (!state.allowed) {
+				return {
+					error: state.mode === 'read-only' ? 'session-read-only' : 'grant-off',
+					hint:
+						state.mode === 'read-only'
+							? 'The session is Read Only: ask the user to raise the permission to Workspace Write, then to switch the Vault control on.'
+							: 'Ask the user to switch the Vault control on, in the composer next to the permission selector. Do not retry and do not use bash.',
+				};
+			}
+			if (exec.signal?.aborted) return { error: 'cancelled', hint: 'The call was cancelled.' };
+			if (!absolutePath(root)) return { error: 'write-root-invalid', hint: 'Set an absolute Vault write path in Plugins → Vault Tab.' };
+			if (!(await probe(root)).directory) return { error: 'write-root-missing', root, hint: 'The vault folder does not exist; ask the user, or use vault_setup.' };
+			const confined = await confinePath(root, args.path);
+			if (confined.error) return { error: confined.error, hint: 'Keep the path inside the vault root: no leading slash, no .. segment.' };
+			const bytes = Buffer.byteLength(String(args.content ?? ''), 'utf8');
+			if (bytes > MAX_WRITE_BYTES) return { error: 'too-large', bytes, hint: `The limit is ${MAX_WRITE_BYTES} bytes.` };
+			const existing = await probe(confined.target);
+			if (existing.directory) return { error: 'is-directory', path: confined.target, hint: 'Choose a file path, not a folder.' };
+			if (existing.exists && args.overwrite !== true) return { error: 'exists', hint: 'Read the file, then send the complete new content with overwrite: true.' };
+			// Re-check containment immediately before the syscalls: the checked
+			// path must be the written one, and an ancestor symlink may have been
+			// swapped since the first pass.
+			const fresh = await confinePath(root, args.path);
+			if (fresh.error || fresh.target !== confined.target) return { error: 'outside-root', hint: 'The path changed while writing; nothing was written.' };
+			const dir = path.dirname(fresh.target);
+			const temp = path.join(dir, `.${path.basename(fresh.target)}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+			try {
+				await mkdir(dir, { recursive: true });
+				await writeFile(temp, String(args.content ?? ''), 'utf8');
+				await rename(temp, fresh.target);
+			} catch (error) {
+				await rm(temp, { force: true }).catch(() => {});
+				return { error: 'write-failed', hint: String((error && error.message) || error) };
+			}
+			return {
+				path: path.relative(root, fresh.target).split(path.sep).join('/'),
+				bytes,
+				action: existing.exists ? 'replaced' : 'created',
+				root,
+			};
+		},
+	};
+}
+
+/** Human-only switch of the grant: the composer chip calls it, the model never does. */
+function writeCommand(ctx, config) {
+	return {
+		name: 'vault-write',
+		description: 'Show or change this session’s Vault Grant — the Vault control beside the permission selector.',
+		input: { hint: 'on | off | status' },
+		handler: ({ agent, rawInput }) => {
+			const root = writeRootOf(config);
+			const state = grantState(ctx, agent.session, grantDefault(config));
+			const arg = String(rawInput ?? '').trim().toLowerCase();
+			if (arg === 'on' || arg === 'off') {
+				if (!state.editable) {
+					return { kind: 'error', text: `The Vault Grant only changes under Workspace Write (this session is ${state.mode ?? 'unknown'}).` };
+				}
+				grants.set(agent.session.header.id, arg === 'on');
+				return { kind: 'success', text: `Vault Grant ${arg}: writes inside ${root} are ${arg === 'on' ? 'allowed' : 'blocked'}.` };
+			}
+			if (arg !== '' && arg !== 'status') return { kind: 'error', text: 'Usage: /vault-write on | off | status' };
+			return {
+				kind: 'success',
+				text: `Vault Grant: ${state.allowed ? 'on' : 'off'} · permission ${state.mode ?? 'unknown'} · ${
+					state.editable ? 'editable' : 'not editable under this permission'
+				} · root ${root}`,
+			};
+		},
+	};
+}
+
 export function apply(ctx, config) {
 	// --- Vault tab listing -----------------------------------------------------
 	const handler = async (req, res) => {
@@ -402,6 +610,56 @@ export function apply(ctx, config) {
 		return json(res, 200, { root, entries, truncated: dirents.length > MAX_ENTRIES });
 	};
 	ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/vault-tab/list', handler }), 'dsh-vault-tab: list route');
+
+	// --- Vault Grant state for the composer chip -------------------------------
+	// Read-only by design: this route reports the shared resolver's verdict and
+	// never changes it. Granting authority stays a human action, so the only
+	// write path is the /vault-write command, which arrives through the peer's
+	// own session binding — a route this Host could answer to a local curl could
+	// let the model grant itself.
+	const grantHandler = async (req, res) => {
+		if (req.method !== 'GET') return json(res, 405, { error: 'method-not-allowed' });
+		const site = req.headers['sec-fetch-site'];
+		if (site && site !== 'same-origin') return json(res, 403, { error: 'foreign-origin' });
+		const url = new URL(req.url, 'http://dsh.invalid');
+		const id = url.searchParams.get('session') ?? '';
+		const root = writeRootOf(config);
+		const agent = ctx.get('agents')?.get(id);
+		if (!agent) return json(res, 200, { root, mode: null, allowed: false, editable: false, reason: 'no-live-session' });
+		const state = grantState(ctx, agent.session, grantDefault(config));
+		return json(res, 200, { root, mode: state.mode ?? null, allowed: state.allowed, editable: state.editable });
+	};
+	ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/vault-tab/grant', handler: grantHandler }), 'dsh-vault-tab: grant route');
+
+	// The write capability needs the mode, a tool slot and a human command; a
+	// profile without any of them still gets the tab and the read-only listing.
+	ctx.inject(['tools', 'commands', 'sandboxPolicy'], (scope) => {
+		scope.effect(() => scope.tools.register(writeTool(scope, config)), 'dsh-vault-tab: write tool');
+		scope.effect(() => scope.commands.register(writeCommand(scope, config)), 'dsh-vault-tab: write command');
+	});
+
+	ctx.inject(['skills'], (scope) => {
+		const file = path.join(HERE, 'skills', 'vault-note.md');
+		let text;
+		try {
+			text = readFileSync(file, 'utf8');
+		} catch (error) {
+			scope.logger.warn('dsh-vault-tab: %s unreadable, note skill not registered (%s)', file, String((error && error.message) || error));
+			return;
+		}
+		const body = text.replace(/^﻿/, '').replace(/^---[^]*?---\s*/, '').trim();
+		scope.effect(
+			() =>
+				scope.skills.register({
+					name: NOTE_SKILL_NAME,
+					description: NOTE_SKILL_DESCRIPTION,
+					whenToUse: NOTE_SKILL_WHEN_TO_USE,
+					content: body,
+					provider: '@local/dsh-vault-tab',
+				}),
+			'dsh-vault-tab: note skill',
+		);
+	});
 
 	// --- Vault setup capability --------------------------------------------------
 	// The skill is guidance only, so it costs context in every session: the

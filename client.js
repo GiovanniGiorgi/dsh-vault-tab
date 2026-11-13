@@ -45,6 +45,15 @@ window.__ModuleLoader__.load({
         save: 'Save',
         discard: 'Discard',
         saveFailed: 'Saving failed. Try again.',
+        'grant.title': 'Vault',
+        'grant.on': 'on',
+        'grant.off': 'off',
+        'grant.editableHint': 'Grants writes inside the Vault folder, confined to the configured root.',
+        'grant.readOnlyHint': 'Read Only blocks every write. Raise the permission to Workspace Write to grant it.',
+        'grant.fullHint': 'Already covered by Full access.',
+        'grant.customHint': 'Permission preset not recognised; the grant only applies to Workspace Write.',
+        'grant.noProjection': 'The permission state is not available yet.',
+        'grant.pending': 'Checking the Vault Grant…',
       },
     };
 
@@ -484,16 +493,175 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ── Composer chip: Vault Grant ──────────────────────────────────────────
+    // Visual preview of the control specified in task/vault-write-grant.md:
+    // display only. No grant is stored, no command is sent, no Host route is
+    // called. Geometry, type size and interaction states copy the shipped
+    // permission trigger (28px row, 13px/500, radius-sm, hover bg, focus ring,
+    // dimmed disabled); classes are renamed under dvt_grant* and only
+    // --dsw-alias-* tokens are referenced, so a renamed token fades the look
+    // and never breaks the composer.
+    const GRANT_CSS = [
+      '.dvt_grant{border-radius:var(--dsw-radius-sm);min-width:0;max-width:220px;height:28px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:0;outline:none;align-items:center;gap:5px;padding:0 6px 0 8px;font-size:13px;font-weight:500;line-height:20px;display:inline-flex}',
+      '.dvt_grant:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dvt_grant:focus-visible{box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}',
+      '.dvt_grant:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}',
+      '.dvt_grantIcon{flex:none;display:inline-flex}',
+      '.dvt_grantLabel{white-space:nowrap;text-overflow:ellipsis;min-width:0;overflow:hidden}',
+      '.dvt_grantDot{border-radius:50%;flex:none;width:6px;height:6px;background:var(--dsw-alias-state-idle-primary)}',
+      '.dvt_grantOn{color:var(--dsw-alias-label-primary)}',
+      '.dvt_grantOn .dvt_grantDot{background:var(--dsw-alias-state-success-primary)}',
+      '.dvt_grantBusy{opacity:.55}',
+      '@container (width<=460px){.dvt_grant .dvt_grantLabel{display:none}}',
+    ].join('');
+
+    /** Host answer of "may this session write to the vault", shared with the tool. */
+    const GRANT_ENDPOINT = '/vault-tab/grant';
+
+    function GrantIcon(props) {
+      const size = props && props.size ? props.size : 14;
+      return h(
+        'svg',
+        {
+          viewBox: '0 0 16 16',
+          width: size,
+          height: size,
+          'aria-hidden': true,
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.3,
+          strokeLinecap: 'round',
+          style: { display: 'block' },
+        },
+        h('rect', { x: 3.2, y: 7, width: 9.6, height: 6.1, rx: 1.6 }),
+        props && props.open
+          ? h('path', { d: 'M5.1 7V5.2A2.7 2.7 0 0 1 10.3 4.4' })
+          : h('path', { d: 'M5.1 7V5a2.9 2.9 0 0 1 5.8 0v2' }),
+      );
+    }
+
+    /**
+     * The chip. Its answer comes from the same Host resolver that gates the
+     * `vault_write` tool (`GET /vault-tab/grant`), so the control can never show
+     * a permission the tool would refuse. The click runs the human
+     * `/vault-write` command through the session's own binding: the grant stays
+     * out of the model's reach, and no route ever changes it.
+     *
+     * Display rule (decided): Read Only → off, locked. Workspace Write → the
+     * session's stored value, editable, and kept while the mode changes and the
+     * session lives. Full access → on, locked.
+     */
+    function VaultGrantChip(props) {
+      const t = props.t;
+      const sessionId = props.sessionId;
+      const sessions = props.sessions;
+      const projection = props.useProjection('permissions');
+      const [state, setState] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const refresh = React.useCallback(function () {
+        if (!sessionId) return;
+        fetch(GRANT_ENDPOINT + '?session=' + encodeURIComponent(sessionId), { credentials: 'same-origin' })
+          .then(function (response) {
+            return response.ok ? response.json() : Promise.reject(new Error('grant ' + response.status));
+          })
+          .then(function (body) {
+            setState(body && typeof body.allowed === 'boolean' ? body : null);
+          })
+          .catch(function () {
+            setState(null);
+          });
+      }, [sessionId]);
+      React.useEffect(refresh, [refresh]);
+      // The permission projection is not the source of truth here, only the
+      // signal that the server's verdict may have changed.
+      const preset = projection && projection.currentValue;
+      React.useEffect(refresh, [refresh, preset]);
+
+      const toggle = function () {
+        if (!state || !state.editable || busy) return;
+        const binding = sessionId && sessions ? sessions.binding(sessionId) : null;
+        const session = binding && binding.session;
+        if (!session || typeof session.command !== 'function') return;
+        setBusy(true);
+        Promise.resolve()
+          .then(function () {
+            return session.command('/vault-write ' + (state.allowed ? 'off' : 'on'));
+          })
+          .catch(function () {
+            // The command reports its own failure in the composer flow; the
+            // refetch below shows the unchanged state, so nothing is hidden.
+          })
+          .then(refresh)
+          .then(function () {
+            setBusy(false);
+          });
+      };
+
+      const allow = !!(state && state.allowed);
+      const editable = !!(state && state.editable);
+      const mode = (state && state.mode) || '';
+      const hint = !state
+        ? t('grant.noProjection')
+        : mode === 'read-only'
+          ? t('grant.readOnlyHint')
+          : editable
+            ? t('grant.editableHint')
+            : mode === 'danger-full-access'
+              ? t('grant.fullHint')
+              : t('grant.customHint');
+      return h(
+        React.Fragment,
+        null,
+        h('style', null, GRANT_CSS),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dvt_grant' + (allow ? ' dvt_grantOn' : '') + (busy ? ' dvt_grantBusy' : ''),
+            role: 'switch',
+            'aria-checked': allow,
+            disabled: !editable || busy,
+            title: hint + (state && state.root ? ' · ' + state.root : ''),
+            onClick: toggle,
+          },
+          h(GrantIcon, { open: allow }),
+          h('span', { className: 'dvt_grantLabel' }, t('grant.title') + ': ' + (state ? (allow ? t('grant.on') : t('grant.off')) : '…')),
+          h('span', { className: 'dvt_grantDot', 'aria-hidden': true }),
+        ),
+      );
+    }
+
     return {
       // configForms is a real dependency here: an undeclared ctx access does
       // not resolve in the browser fiber. It ships with the GUI settings
       // stack; the client half only runs in a GUI profile anyway.
-      inject: ['slots', 'locale', 'sidebarRightTabs', 'configForms'],
+      inject: ['slots', 'locale', 'sidebarRightTabs', 'configForms', 'sessions'],
       apply(ctx) {
         const t = ctx.locale.bind(NS);
         ctx.effect(function () {
           return ctx.locale.register(NS, L10N);
         }, 'vault-tab: dictionaries');
+        // Seat: the compact controls right after the permission picker in the
+        // composer tool row (`conversation.input.left`, rendered immediately
+        // after the `.modes` group that owns `conversation.input.permission`).
+        ctx.effect(function () {
+          return ctx.slots.inject('conversation.input.left', function () {
+            return ctx.slots.register(
+              {
+                name: 'conversation.input.left',
+                id: 'vault-grant',
+                order: 10,
+                locale: NS,
+                // `sessions` drives the human command; the seat already hands the
+                // component its own `sessionId`.
+                inject: function () {
+                  return { sessions: ctx.sessions };
+                },
+              },
+              VaultGrantChip,
+            );
+          });
+        }, 'vault-tab: composer grant chip');
         ctx.effect(function () {
           return ctx.sidebarRightTabs.register({
             id: ID,
