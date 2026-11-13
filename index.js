@@ -66,10 +66,12 @@ const NEVER_ROOTS = new Set(['/', '/bin', '/boot', '/dev', '/etc', '/home', '/li
  * so the next listing already uses the new value). Empty means the default
  * `<home>/Vault`; `~` in a configured path expands to the home directory.
  *
- * `skillSetup` is deliberately NOT volatile: the Loader disposes and re-applies
- * the row when a plain field changes, which is exactly how registering the
- * setup skill on and off works. A volatile flag would leave an already
- * registered skill in the catalog after the user switches it off.
+ * `skillSetup` is volatile too, and not by accident: the settings service
+ * serves and mutates ONLY volatile fields (`volatileForm` in dsh-settings), so
+ * an ordinary field would be invisible to the card and its writes refused.
+ * Volatile commits do not restart the row; the loader updates the reference in
+ * place and emits `loader/volatile-update` on the fiber's ctx, and the skill
+ * registration follows that event live (see `syncSkill`).
  */
 export const Config = z.object({
 	root: z
@@ -80,7 +82,8 @@ export const Config = z.object({
 	skillSetup: z
 		.boolean()
 		.default(true)
-		.description('Register the vault-setup skill, which scaffolds or adopts a vault folder through the vault_setup tool.'),
+		.description('Register the vault-setup skill, which scaffolds or adopts a vault folder through the vault_setup tool.')
+		.volatile(),
 });
 
 /** Volatile fields arrive as `{ get() }` references; plain values pass through. */
@@ -272,9 +275,10 @@ function setupTool(ctx, config) {
 			}
 
 			if (action === 'hide-skill') {
-				// Retire the registration before persisting: writing a non-volatile
-				// field re-applies this row, and the answer must not depend on that.
-				const hidden = typeof hideSkillSetup === 'function' ? hideSkillSetup() : false;
+				// Retire the live registration directly: the volatile write below
+				// also reaches `syncSkill` through the loader event, and both paths
+				// are idempotent.
+				const hidden = typeof skillOff === 'function' ? skillOff() : false;
 				let persisted = false;
 				try {
 					persisted = await writeConfig(ctx, { skillSetup: false });
@@ -338,8 +342,17 @@ function setupTool(ctx, config) {
 	};
 }
 
-/** Disposer of the live skill registration, while one is installed. */
-let hideSkillSetup = null;
+/** Unregister closure of the live setup-skill registration, while one is installed. */
+let skillOff = null;
+
+/** Bring the live registration in line with the (volatile) `skillSetup` flag. */
+function syncSkill(ctx, config) {
+	if (!ctx) return;
+	const want = currentValue(config && config.skillSetup) !== false;
+	if (want) {
+		if (!skillOff) registerSetupSkill(ctx);
+	} else if (skillOff) skillOff();
+}
 
 const SKILL_NAME = 'vault-setup';
 const SKILL_DESCRIPTION = 'Create or adopt the vault folder that the Vault Tab plugin lists: check the configured path, seed the PARA structure, write the root POLICY.md.';
@@ -391,16 +404,32 @@ export function apply(ctx, config) {
 	ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/vault-tab/list', handler }), 'dsh-vault-tab: list route');
 
 	// --- Vault setup capability --------------------------------------------------
+	// The skill is guidance only, so it costs context in every session: the
+	// card toggle removes it, and the skill's last step offers to do that.
+	// `skillSetup` is volatile, so saving it never restarts this row: the
+	// loader commits the value into the live reference and emits
+	// "loader/volatile-update" on this fiber's ctx, and the registration
+	// follows the switch live. The event is loader-internal; if a future
+	// loader dropped it, the flag would still apply at the next activation,
+	// and the `hide-skill` action works through `skillOff` regardless.
+	let setupScope = null;
+	ctx.effect(() => {
+		const off = typeof ctx.on === 'function' ? ctx.on('loader/volatile-update', () => syncSkill(setupScope, config)) : void 0;
+		return typeof off === 'function' ? off : void 0;
+	}, 'dsh-vault-tab: volatile skill sync');
 	ctx.inject(['tools', 'skills'], (setupCtx) => {
+		setupScope = setupCtx;
+		setupCtx.effect(() => () => {
+			if (setupScope === setupCtx) setupScope = null;
+		}, 'dsh-vault-tab: setup scope release');
 		setupCtx.effect(() => setupCtx.tools.register(setupTool(setupCtx, config)), 'dsh-vault-tab: setup tool');
-		// The skill is guidance only, so it costs context in every session: the
-		// card toggle removes it, and the skill's last step offers to do that.
-		if (config.skillSetup !== false) registerSetupSkill(setupCtx);
+		syncSkill(setupCtx, config);
 	});
 }
 
-/** Register `skills/vault-setup.md` for this activation, with a runtime off switch. */
+/** Register `skills/vault-setup.md` against the setup scope; `syncSkill` decides when. */
 function registerSetupSkill(ctx) {
+	if (!ctx) return;
 	let definition;
 	try {
 		definition = {
@@ -414,26 +443,24 @@ function registerSetupSkill(ctx) {
 		return;
 	}
 	const state = { gone: false };
-	ctx.effect(() => {
-		// The service ties the registration's own effect to this scope: scope
-		// teardown unregisters the skill. Calling the disposer from this cleanup
-		// would re-enter a teardown already in progress and fail the whole
-		// config reload, so leave it to the scope.
-		const off = ctx.skills.register(definition);
-		const mine = () => {
-			if (state.gone) return false;
-			state.gone = true;
-			if (hideSkillSetup === mine) hideSkillSetup = null;
-			off();
-			return true;
-		};
-		hideSkillSetup = mine;
-		return () => {
-			state.gone = true;
-			// Compare before clearing: a replacement activation may already
-			// own the module pointer, and this cleanup must not steal it.
-			if (hideSkillSetup === mine) hideSkillSetup = null;
-		};
+	const off = ctx.skills.register(definition);
+	const mine = () => {
+		if (state.gone) return false;
+		state.gone = true;
+		if (skillOff === mine) skillOff = null;
+		off();
+		return true;
+	};
+	skillOff = mine;
+	// The service unregisters with the scope's own teardown; this cleanup only
+	// marks the state and releases the module pointer. Calling the disposer
+	// during teardown would re-enter a teardown already in progress and fail
+	// the whole config reload.
+	ctx.effect(() => () => {
+		state.gone = true;
+		// Compare before clearing: a replacement activation may already own
+		// the module pointer, and this cleanup must not steal it.
+		if (skillOff === mine) skillOff = null;
 	}, 'dsh-vault-tab: setup skill');
 }
 

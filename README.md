@@ -78,9 +78,10 @@ already there.
 
 Once the vault is ready the skill offers to retire itself: it exists only for
 setup and costs context in every session. The same switch is available any time
-under **Plugins → Vault Tab → Vault setup skill**. Turning it off re-applies the
-plugin row, so the tab may blink for a moment; turning it back on brings the
-setup flow up again for a later re-check or to move the vault elsewhere.
+under **Plugins → Vault Tab → Vault setup skill**. The flag is live: toggling it
+saves without restarting anything, and new sessions pick the state up
+immediately. Turning it back on brings the setup flow up again for a later
+re-check or to move the vault elsewhere.
 
 ## Security
 
