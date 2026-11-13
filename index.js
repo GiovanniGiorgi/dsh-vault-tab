@@ -413,22 +413,26 @@ function registerSetupSkill(ctx) {
 		if (ctx.logger && ctx.logger.warn) ctx.logger.warn('vault-tab: setup skill unavailable: %s', error && error.message);
 		return;
 	}
-	const state = { gone: false, off: null };
+	const state = { gone: false };
 	ctx.effect(() => {
-		state.off = ctx.skills.register(definition);
-		hideSkillSetup = () => {
+		// The service ties the registration's own effect to this scope: scope
+		// teardown unregisters the skill. Calling the disposer from this cleanup
+		// would re-enter a teardown already in progress and fail the whole
+		// config reload, so leave it to the scope.
+		const off = ctx.skills.register(definition);
+		const mine = () => {
 			if (state.gone) return false;
 			state.gone = true;
-			hideSkillSetup = null;
-			if (state.off) state.off();
+			if (hideSkillSetup === mine) hideSkillSetup = null;
+			off();
 			return true;
 		};
+		hideSkillSetup = mine;
 		return () => {
-			if (hideSkillSetup && state.gone === false) hideSkillSetup = null;
-			if (!state.gone) {
-				state.gone = true;
-				if (state.off) state.off();
-			}
+			state.gone = true;
+			// Compare before clearing: a replacement activation may already
+			// own the module pointer, and this cleanup must not steal it.
+			if (hideSkillSetup === mine) hideSkillSetup = null;
 		};
 	}, 'dsh-vault-tab: setup skill');
 }

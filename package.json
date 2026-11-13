@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-vault-tab",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "type": "module",
   "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault), plus an optional vault-setup skill that scaffolds or adopts that folder through the vault_setup tool",
