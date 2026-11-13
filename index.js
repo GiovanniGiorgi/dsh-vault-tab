@@ -186,6 +186,53 @@ function grantState(ctx, session, fallback) {
 	return { mode, allowed: inherited, editable: true };
 }
 
+/** What to answer when a path is not a usable vault-relative path. */
+const PATH_HINT = 'Keep the path inside the vault root: relative to it, no leading slash, no .. segment.';
+
+/**
+ * The checks every vault mutation shares, in the one order that matters: a live
+ * session, the user’s grant for it, and a write root that is actually a folder.
+ * Returns `{ root }` or the refusal the tool should hand straight back.
+ */
+async function mutationGate(ctx, config, exec, tool) {
+	const agent = exec.agent;
+	if (!agent) return { error: 'no-session', hint: `${tool} only runs for a live session, whose user decides the grant.` };
+	const state = grantState(ctx, agent.session, grantDefault(config));
+	if (!state.allowed) {
+		return {
+			error: state.mode === 'read-only' ? 'session-read-only' : 'grant-off',
+			hint:
+				state.mode === 'read-only'
+					? 'The session is Read Only: ask the user to raise the permission to Workspace Write, then to switch the Vault control on.'
+					: 'Ask the user to switch the Vault control on, in the composer next to the permission selector. Do not retry and do not use bash.',
+		};
+	}
+	if (exec.signal?.aborted) return { error: 'cancelled', hint: 'The call was cancelled.' };
+	const root = writeRootOf(config);
+	if (!absolutePath(root)) return { error: 'write-root-invalid', hint: 'Set an absolute Vault write path in Plugins → Vault Tab.' };
+	if (!(await probe(root)).directory) return { error: 'write-root-missing', root, hint: 'The vault folder does not exist; ask the user, or use vault_setup.' };
+	return { root };
+}
+
+/** The errno a rename or remove failed on, in the vocabulary the vault tools answer with. */
+function failureOf(error, what) {
+	const message = String((error && error.message) || error);
+	switch (error && error.code) {
+		case 'ENOENT':
+			return { error: 'not-found', hint: `The ${what} disappeared before the change; nothing was touched.` };
+		case 'EXDEV':
+			return { error: 'cross-device', hint: 'The two paths sit on different devices; the vault tool does not copy.' };
+		case 'EISDIR':
+		case 'ENOTDIR':
+			return { error: 'wrong-kind', hint: message };
+		case 'EPERM':
+		case 'EACCES':
+			return { error: 'denied-by-system', hint: message };
+		default:
+			return { error: 'change-failed', hint: message };
+	}
+}
+
 /**
  * Resolve `rel` under `root` and prove containment on CANONICAL paths: the
  * lexical test rejects the obvious escapes, then the deepest existing ancestor
@@ -439,8 +486,8 @@ const SKILL_DESCRIPTION = 'Create or adopt the vault folder that the Vault Tab p
 const SKILL_WHEN_TO_USE = 'Use when the vault path is missing, empty or not yet trusted, or when the user asks to set up, initialise, adopt, move or re-check a vault folder.';
 
 const NOTE_SKILL_NAME = 'vault-write';
-const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault_write tool: rules first (root POLICY.md, then the target folder’s POLICY.md), paths, the Vault Grant, and what to do when writing is refused.';
-const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something should be written into the vault: save or jot down a note, file an idea, add or update a note, MOC line or log — even when the user does not say “vault” but means their second brain.';
+const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); create, replace, rename/move with link upkeep, deletion behind a link check; the Vault Grant and what to do when writing is refused.';
+const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something in the vault should change: save or jot down a note, file an idea, add or update a note, MOC line or log, rename or move a file or folder, delete a note — even when the user does not say “vault” but means their second brain.';
 
 /** Model-facing contract of the write tool; short because it is read on every request. */
 const WRITE_TOOL_DESCRIPTION =
@@ -490,24 +537,11 @@ function writeTool(ctx, config) {
 		// Two writes on one file cannot be ordered, and the tool is the boundary.
 		isConcurrencySafe: () => false,
 		async execute(args, exec) {
-			const agent = exec.agent;
-			if (!agent) return { error: 'no-session', hint: 'vault_write only runs for a live session, whose user decides the grant.' };
-			const root = writeRootOf(config);
-			const state = grantState(ctx, agent.session, grantDefault(config));
-			if (!state.allowed) {
-				return {
-					error: state.mode === 'read-only' ? 'session-read-only' : 'grant-off',
-					hint:
-						state.mode === 'read-only'
-							? 'The session is Read Only: ask the user to raise the permission to Workspace Write, then to switch the Vault control on.'
-							: 'Ask the user to switch the Vault control on, in the composer next to the permission selector. Do not retry and do not use bash.',
-				};
-			}
-			if (exec.signal?.aborted) return { error: 'cancelled', hint: 'The call was cancelled.' };
-			if (!absolutePath(root)) return { error: 'write-root-invalid', hint: 'Set an absolute Vault write path in Plugins → Vault Tab.' };
-			if (!(await probe(root)).directory) return { error: 'write-root-missing', root, hint: 'The vault folder does not exist; ask the user, or use vault_setup.' };
+			const gate = await mutationGate(ctx, config, exec, 'vault_write');
+			if (gate.error) return gate;
+			const root = gate.root;
 			const confined = await confinePath(root, args.path);
-			if (confined.error) return { error: confined.error, hint: 'Keep the path inside the vault root: no leading slash, no .. segment.' };
+			if (confined.error) return { error: confined.error, hint: PATH_HINT };
 			const bytes = Buffer.byteLength(String(args.content ?? ''), 'utf8');
 			if (bytes > MAX_WRITE_BYTES) return { error: 'too-large', bytes, hint: `The limit is ${MAX_WRITE_BYTES} bytes.` };
 			const existing = await probe(confined.target);
@@ -532,6 +566,176 @@ function writeTool(ctx, config) {
 				path: path.relative(root, fresh.target).split(path.sep).join('/'),
 				bytes,
 				action: existing.exists ? 'replaced' : 'created',
+				root,
+			};
+		},
+	};
+}
+
+/** Model-facing contract of the move tool; short because it is read on every request. */
+const MOVE_TOOL_DESCRIPTION =
+	'Rename or move one file or folder inside the vault: both paths are relative to the vault root and ' +
+	'neither can leave it, and a folder moves with everything under it. The move does not rewrite links or ' +
+	'backlinks written in other notes, so say that when the note is linked elsewhere. Needs the user’s ' +
+	'Vault Grant.';
+
+function moveTool(ctx, config) {
+	return {
+		name: 'vault_move',
+		description: MOVE_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				from: { type: 'string', description: 'Existing file or folder inside the vault root, relative to it.' },
+				to: { type: 'string', description: 'New path inside the vault root, relative to it. A path in the same folder is a pure rename.' },
+				overwrite: { type: 'boolean', description: 'True replaces an existing file at the target. A folder is never merged into or replaces another folder.' },
+			},
+			required: ['from', 'to'],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					from: { type: 'string', description: 'Old path, relative to the vault root.' },
+					to: { type: 'string', description: 'New path, relative to the vault root.' },
+					kind: { type: 'string', enum: ['file', 'directory'], description: 'What moved.' },
+					action: { type: 'string', enum: ['renamed', 'moved'], description: 'Renamed keeps the parent folder, moved changes it.' },
+					replaced: { type: 'boolean', description: 'True when an existing file at the target was replaced.' },
+					root: { type: 'string', description: 'Absolute vault root both paths are under.' },
+					error: { type: 'string', description: 'Refusal reason, when nothing moved.' },
+					hint: { type: 'string', description: 'What to do instead, when nothing moved.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [
+				{
+					type: 'text',
+					text: value.error
+						? `vault_move refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
+						: `vault_move ${value.action} ${value.from} → ${value.to} (${value.kind}${value.replaced === true ? ', replacing the file that was there' : ''})`,
+				},
+			],
+		},
+		isConcurrencySafe: () => false,
+		async execute(args, exec) {
+			const gate = await mutationGate(ctx, config, exec, 'vault_move');
+			if (gate.error) return gate;
+			const root = gate.root;
+			const source = await confinePath(root, args.from);
+			if (source.error) return { error: source.error, hint: PATH_HINT };
+			const target = await confinePath(root, args.to);
+			if (target.error) return { error: target.error, hint: PATH_HINT };
+			if (source.target === root) return { error: 'is-root', hint: 'The vault root itself is never moved; change the path in Plugins → Vault Tab.' };
+			if (source.target === target.target) return { error: 'same-path', hint: 'Both paths resolve to the same entry; nothing was done.' };
+			const here = await probe(source.target);
+			if (!here.exists) return { error: 'not-found', hint: 'Check the path with glob or in the Vault tab; nothing was moved.' };
+			if (here.directory && target.target.startsWith(source.target + path.sep)) {
+				return { error: 'into-itself', hint: 'A folder cannot move inside itself; choose a target outside it.' };
+			}
+			const there = await probe(target.target);
+			if (there.directory) return { error: 'target-is-directory', hint: 'The target is a folder, and folders are never merged: choose a name inside it.' };
+			if (there.exists && args.overwrite !== true) return { error: 'exists', hint: 'Choose another target, or pass overwrite: true to replace that file.' };
+			// Both paths are verified again immediately before the syscall, exactly
+			// as the write does: the verified paths must be the ones `rename` sees.
+			const freshFrom = await confinePath(root, args.from);
+			const freshTo = await confinePath(root, args.to);
+			if (freshFrom.error || freshTo.error || freshFrom.target !== source.target || freshTo.target !== target.target) {
+				return { error: 'outside-root', hint: 'A path changed while moving; nothing was moved.' };
+			}
+			try {
+				await mkdir(path.dirname(freshTo.target), { recursive: true });
+				if (there.exists) await rm(freshTo.target, { force: true });
+				await rename(freshFrom.target, freshTo.target);
+			} catch (error) {
+				return failureOf(error, there.exists ? 'target' : 'source');
+			}
+			return {
+				from: path.relative(root, freshFrom.target).split(path.sep).join('/'),
+				to: path.relative(root, freshTo.target).split(path.sep).join('/'),
+				kind: here.directory ? 'directory' : 'file',
+				action: path.dirname(freshFrom.target) === path.dirname(freshTo.target) ? 'renamed' : 'moved',
+				...(there.exists ? { replaced: true } : {}),
+				root,
+			};
+		},
+	};
+}
+
+/** Model-facing contract of the delete tool: the destructive one, so its cost is stated up front. */
+const DELETE_TOOL_DESCRIPTION =
+	'Delete one file or folder inside the vault root. There is no trash and no undo: the content is gone, ' +
+	'and a folder takes everything under it with it. Needs the user’s Vault Grant, and a confirm only the ' +
+	'user can give for that exact path.';
+
+function deleteTool(ctx, config) {
+	return {
+		name: 'vault_delete',
+		description: DELETE_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				path: { type: 'string', description: 'File or folder inside the vault root, relative to it.' },
+				recursive: { type: 'boolean', description: 'True deletes a folder together with everything under it. Never needed for a file.' },
+				confirm: { type: 'boolean', description: 'Must be true, and only after the user agreed to delete this exact path.' },
+			},
+			required: ['path'],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					path: { type: 'string', description: 'Deleted path, relative to the vault root.' },
+					kind: { type: 'string', enum: ['file', 'directory'], description: 'What was deleted.' },
+					entries: { type: 'integer', description: 'How many entries a deleted folder held.' },
+					root: { type: 'string', description: 'Absolute vault root the path is under.' },
+					error: { type: 'string', description: 'Refusal reason, when nothing was deleted.' },
+					hint: { type: 'string', description: 'What to do instead, when nothing was deleted.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [
+				{
+					type: 'text',
+					text: value.error
+						? `vault_delete refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
+						: `vault_delete deleted ${value.path} (${value.kind}${value.entries === void 0 ? '' : `, ${value.entries} entries`})`,
+				},
+			],
+		},
+		isConcurrencySafe: () => false,
+		async execute(args, exec) {
+			const gate = await mutationGate(ctx, config, exec, 'vault_delete');
+			if (gate.error) return gate;
+			const root = gate.root;
+			const confined = await confinePath(root, args.path);
+			if (confined.error) return { error: confined.error, hint: PATH_HINT };
+			if (confined.target === root) return { error: 'is-root', hint: 'The vault root itself is never deleted; change the path in Plugins → Vault Tab.' };
+			const at = await probe(confined.target);
+			if (!at.exists) return { error: 'not-found', hint: 'Nothing was deleted.' };
+			if (at.directory && args.recursive !== true) return { error: 'is-directory', hint: 'Pass recursive: true to delete the folder and everything under it.' };
+			let entries;
+			if (at.directory) {
+				try {
+					entries = (await readdir(confined.target)).length;
+				} catch {
+					entries = void 0;
+				}
+			}
+			// The user’s agreement is the last gate before the removal.
+			if (args.confirm !== true) return { error: 'needs-confirm', hint: 'Ask the user to confirm deleting this exact path, then repeat with confirm: true.' };
+			const fresh = await confinePath(root, args.path);
+			if (fresh.error || fresh.target !== confined.target) return { error: 'outside-root', hint: 'The path changed while deleting; nothing was deleted.' };
+			try {
+				await rm(fresh.target, { recursive: at.directory, force: true });
+			} catch (error) {
+				return failureOf(error, 'target');
+			}
+			return {
+				path: path.relative(root, fresh.target).split(path.sep).join('/'),
+				kind: at.directory ? 'directory' : 'file',
+				...(entries === void 0 ? {} : { entries }),
 				root,
 			};
 		},
@@ -574,7 +778,7 @@ function infoTool(ctx, config) {
 					grant: {
 						type: 'object',
 						properties: {
-							mode: { type: ['string', 'null'], description: 'Session permission mode: read-only, workspace-write, danger-full-access; null without a live session.' },
+							mode: { type: 'string', description: 'Session permission mode: read-only, workspace-write or danger-full-access. Omitted when no live session answers.' },
 							allowed: { type: 'boolean', description: 'Whether vault_write would write right now.' },
 							editable: { type: 'boolean', description: 'Whether the user can toggle the Vault Grant in this mode.' },
 						},
@@ -600,7 +804,9 @@ function infoTool(ctx, config) {
 				exists: at.directory,
 				hasPolicy,
 				...(hasPolicy ? { policyPath: policy } : {}),
-				grant: { mode: state.mode, allowed: state.allowed, editable: state.editable },
+				// `null` has no place in the output schema, whose subset allows one
+				// type per node: a mode that does not exist is simply omitted.
+				grant: { ...(state.mode ? { mode: state.mode } : {}), allowed: state.allowed, editable: state.editable },
 			};
 			if (args?.include === 'default-policy') {
 				if (hasPolicy) out.error = 'vault-has-own-policy';
@@ -714,6 +920,8 @@ export function apply(ctx, config) {
 	// profile without any of them still gets the tab and the read-only listing.
 	ctx.inject(['tools', 'commands', 'sandboxPolicy'], (scope) => {
 		scope.effect(() => scope.tools.register(writeTool(scope, config)), 'dsh-vault-tab: write tool');
+		scope.effect(() => scope.tools.register(moveTool(scope, config)), 'dsh-vault-tab: move tool');
+		scope.effect(() => scope.tools.register(deleteTool(scope, config)), 'dsh-vault-tab: delete tool');
 		scope.effect(() => scope.tools.register(infoTool(scope, config)), 'dsh-vault-tab: info tool');
 		scope.effect(() => scope.commands.register(writeCommand(scope, config)), 'dsh-vault-tab: write command');
 	});
@@ -735,6 +943,11 @@ export function apply(ctx, config) {
 					description: NOTE_SKILL_DESCRIPTION,
 					whenToUse: NOTE_SKILL_WHEN_TO_USE,
 					content: body,
+					// `source` is required even though `register()` does not check it:
+					// the loader validates the whole definition, so a registration
+					// without it shows up in the catalog and then fails the moment
+					// anyone actually loads the skill.
+					source: 'runtime',
 					provider: '@local/dsh-vault-tab',
 				}),
 			'dsh-vault-tab: note skill',
@@ -774,6 +987,7 @@ function registerSetupSkill(ctx) {
 			name: SKILL_NAME,
 			description: SKILL_DESCRIPTION,
 			whenToUse: SKILL_WHEN_TO_USE,
+			source: 'runtime',
 			content: readFileSync(path.join(HERE, 'skills', 'vault-setup.md'), 'utf8'),
 		};
 	} catch (error) {

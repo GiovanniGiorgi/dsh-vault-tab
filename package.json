@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-vault-tab",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
-  "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault), plus a vault-setup skill that scaffolds or adopts that folder and a vault-note skill that writes into it through the vault_write tool, under a per-session Vault Grant decided in the composer",
+  "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault), plus a vault-setup skill that scaffolds or adopts that folder and a vault-write skill that writes, renames and deletes inside it through the vault_* tools, under a per-session Vault Grant decided in the composer",
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"
   },
