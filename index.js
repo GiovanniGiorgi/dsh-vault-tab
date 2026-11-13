@@ -438,9 +438,9 @@ const SKILL_NAME = 'vault-setup';
 const SKILL_DESCRIPTION = 'Create or adopt the vault folder that the Vault Tab plugin lists: check the configured path, seed the PARA structure, write the root POLICY.md.';
 const SKILL_WHEN_TO_USE = 'Use when the vault path is missing, empty or not yet trusted, or when the user asks to set up, initialise, adopt, move or re-check a vault folder.';
 
-const NOTE_SKILL_NAME = 'vault-note';
-const NOTE_SKILL_DESCRIPTION = 'Save a note into the vault folder with the vault_write tool of the Vault Tab plugin, under the Vault Grant the user decides in the composer.';
-const NOTE_SKILL_WHEN_TO_USE = 'Use when the user asks to save, jot down or file something in the vault, outside the current workspace.';
+const NOTE_SKILL_NAME = 'vault-write';
+const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault_write tool: rules first (root POLICY.md, then the target folder’s POLICY.md), paths, the Vault Grant, and what to do when writing is refused.';
+const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something should be written into the vault: save or jot down a note, file an idea, add or update a note, MOC line or log — even when the user does not say “vault” but means their second brain. Pure reading or search is not this skill.';
 
 /** Model-facing contract of the write tool; short because it is read on every request. */
 const WRITE_TOOL_DESCRIPTION =
@@ -534,6 +534,85 @@ function writeTool(ctx, config) {
 				action: existing.exists ? 'replaced' : 'created',
 				root,
 			};
+		},
+	};
+}
+
+/** Model-facing contract of the read-only info tool; short, read on every request. */
+const INFO_TOOL_DESCRIPTION =
+	'Read-only facts about the vault the Vault Tab plugin manages, for the rules-first write flow: the ' +
+	'absolute vault root and write root, whether the vault keeps a POLICY.md at its root (with its path, ' +
+	'to read with the normal tools), this session’s Vault Grant state, and — with include "default-policy" ' +
+	'— the plugin’s default vault policy text for vaults that have none of their own. Writes nothing.';
+
+/** The lightweight companion of `vault_write`: locate the rules, check the grant, cost nothing. */
+function infoTool(ctx, config) {
+	return {
+		name: 'vault_info',
+		description: INFO_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				include: {
+					type: 'string',
+					enum: ['default-policy'],
+					description: 'Also return the plugin’s default policy text; set it only when the vault has no POLICY.md at its root.',
+				},
+			},
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					root: { type: 'string', description: 'Absolute folder the Vault tab lists.' },
+					writeRoot: { type: 'string', description: 'Absolute folder vault_write may write.' },
+					exists: { type: 'boolean', description: 'Whether the write root currently exists as a folder.' },
+					hasPolicy: { type: 'boolean', description: 'True when POLICY.md sits at the vault root.' },
+					policyPath: { type: 'string', description: 'Absolute path of the root POLICY.md, when it exists.' },
+					defaultPolicy: { type: 'string', description: 'The plugin’s default policy text, when requested and the vault has none.' },
+					grant: {
+						type: 'object',
+						properties: {
+							mode: { type: ['string', 'null'], description: 'Session permission mode: read-only, workspace-write, danger-full-access; null without a live session.' },
+							allowed: { type: 'boolean', description: 'Whether vault_write would write right now.' },
+							editable: { type: 'boolean', description: 'Whether the user can toggle the Vault Grant in this mode.' },
+						},
+					},
+					error: { type: 'string', description: 'Refusal reason, when something could not be reported.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+		},
+		isConcurrencySafe: () => true,
+		async execute(args, exec) {
+			const root = resolveRoot(currentValue(config.root));
+			const writeRoot = writeRootOf(config);
+			const at = await probe(writeRoot);
+			const policy = path.join(writeRoot, 'POLICY.md');
+			const policyAt = await probe(policy);
+			const hasPolicy = policyAt.exists && !policyAt.directory;
+			const state = exec.agent ? grantState(ctx, exec.agent.session, grantDefault(config)) : { mode: null, allowed: false, editable: false };
+			const out = {
+				root,
+				writeRoot,
+				exists: at.directory,
+				hasPolicy,
+				...(hasPolicy ? { policyPath: policy } : {}),
+				grant: { mode: state.mode, allowed: state.allowed, editable: state.editable },
+			};
+			if (args?.include === 'default-policy') {
+				if (hasPolicy) out.error = 'vault-has-own-policy';
+				else {
+					try {
+						out.defaultPolicy = await readAsset('vault-policy.md');
+					} catch (error) {
+						out.error = 'default-policy-unavailable';
+					}
+				}
+			}
+			return out;
 		},
 	};
 }
@@ -635,11 +714,12 @@ export function apply(ctx, config) {
 	// profile without any of them still gets the tab and the read-only listing.
 	ctx.inject(['tools', 'commands', 'sandboxPolicy'], (scope) => {
 		scope.effect(() => scope.tools.register(writeTool(scope, config)), 'dsh-vault-tab: write tool');
+		scope.effect(() => scope.tools.register(infoTool(scope, config)), 'dsh-vault-tab: info tool');
 		scope.effect(() => scope.commands.register(writeCommand(scope, config)), 'dsh-vault-tab: write command');
 	});
 
 	ctx.inject(['skills'], (scope) => {
-		const file = path.join(HERE, 'skills', 'vault-note.md');
+		const file = path.join(HERE, 'skills', 'vault-write.md');
 		let text;
 		try {
 			text = readFileSync(file, 'utf8');
