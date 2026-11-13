@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-vault-tab",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "type": "module",
   "description": "Right-sidebar tab with a second file tree rooted at a configured folder (Vault), plus a vault-setup skill that scaffolds or adopts that folder and a vault-note skill that writes into it through the vault_write tool, under a per-session Vault Grant decided in the composer",

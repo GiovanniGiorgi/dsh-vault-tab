@@ -440,7 +440,7 @@ const SKILL_WHEN_TO_USE = 'Use when the vault path is missing, empty or not yet 
 
 const NOTE_SKILL_NAME = 'vault-write';
 const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault_write tool: rules first (root POLICY.md, then the target folder’s POLICY.md), paths, the Vault Grant, and what to do when writing is refused.';
-const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something should be written into the vault: save or jot down a note, file an idea, add or update a note, MOC line or log — even when the user does not say “vault” but means their second brain. Pure reading or search is not this skill.';
+const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something should be written into the vault: save or jot down a note, file an idea, add or update a note, MOC line or log — even when the user does not say “vault” but means their second brain.';
 
 /** Model-facing contract of the write tool; short because it is read on every request. */
 const WRITE_TOOL_DESCRIPTION =

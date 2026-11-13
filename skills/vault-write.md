@@ -39,11 +39,10 @@ the user in Obsidian. Do not improvise with `bash`.
 
 ## 3. The Vault Grant
 
-Reading needs nothing, in any permission mode. Writing needs the user's **Vault**
-control, in the composer beside the permission selector: Read Only never writes;
-Workspace Write writes only while the control is on; Full access is always on and
-the control is locked. The chip shows the true state, and `vault_info`'s `grant`
-field mirrors it — trust them over guessing.
+Writing needs the user's **Vault** control, in the composer beside the permission
+selector: Read Only never writes; Workspace Write writes only while the control is
+on; Full access is always on and the control is locked. The chip shows the true
+state, and `vault_info`'s `grant` field mirrors it — trust them over guessing.
 
 When `vault_write` answers `grant-off` or `session-read-only`:
 
