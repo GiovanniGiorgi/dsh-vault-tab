@@ -157,6 +157,12 @@ const grants = new Map();
 /** Largest content one `vault_write` accepts. */
 const MAX_WRITE_BYTES = 1 << 20;
 
+/** Notes one link scan reads at most; a bigger vault reports `truncated`. */
+const LINK_SCAN_CAP = 4000;
+
+/** Referrer lines one call reports; the count is exact, the list is a sample. */
+const LINK_REPORT_CAP = 40;
+
 /** Starting grant of a session that never toggled it. */
 function grantDefault(config) {
 	return currentValue(config && config.vaultGrantDefault) === true;
@@ -208,6 +214,20 @@ async function mutationGate(ctx, config, exec, tool) {
 		};
 	}
 	if (exec.signal?.aborted) return { error: 'cancelled', hint: 'The call was cancelled.' };
+	return resolvedWriteRoot(config);
+}
+
+/**
+ * The same root checks without the grant: a link scan reads the vault, and
+ * reading is not a mutation — `dryRun` and the delete link check answer whether
+ * a change is safe before the user has decided anything.
+ */
+async function readGate(ctx, config) {
+	return resolvedWriteRoot(config);
+}
+
+/** The configured write root, proven to be a folder, or the refusal to hand back. */
+async function resolvedWriteRoot(config) {
 	const root = writeRootOf(config);
 	if (!absolutePath(root)) return { error: 'write-root-invalid', hint: 'Set an absolute Vault write path in Plugins → Vault Tab.' };
 	if (!(await probe(root)).directory) return { error: 'write-root-missing', root, hint: 'The vault folder does not exist; ask the user, or use vault_setup.' };
@@ -231,6 +251,207 @@ function failureOf(error, what) {
 		default:
 			return { error: 'change-failed', hint: message };
 	}
+}
+
+/**
+ * One vault link: `[[path]]`, `[[path#anchor|alias]]`, and the `![[…]]` embeds,
+ * which contain the `[[…]]` form and need no extra rule. Group 1 is the path,
+ * 2 the `#` anchor, 3 the `|` alias — the tail is captured so a rewrite can put
+ * it back untouched.
+ */
+const LINK_PATTERN = /\[\[([^[\]|#]+)((?:#[^[\]|]*))?(\|[^[\]]*)?\]\]/g;
+
+/** Vault links carry no extension; a stray `.md` is tolerated when reading. */
+function linkPath(raw) {
+	return String(raw).trim().replace(/\.md$/, '');
+}
+
+/**
+ * True when link path `p` is the target, or something inside it for a folder.
+ * Placeholders are never links: `POLICY.md` and the templates document the
+ * convention with `[[90-Reference/<project>]]` and `[[<path/from/root>]]`, and a
+ * folder prefix would otherwise rewrite the rules that describe the folder.
+ */
+function refersTo(p, target, folder) {
+	if (p.includes('<') || p.includes('>') || p.includes('…')) return false;
+	return p === target || (folder === true && p.startsWith(target + '/'));
+}
+
+/** Lines outside ``` fences, with 1-based numbers: a link inside a fence is an example, not a link. */
+function proseLines(text) {
+	const lines = [];
+	let fence = false;
+	text.split('\n').forEach((line, index) => {
+		if (line.trimStart().startsWith('```')) {
+			fence = !fence;
+			return;
+		}
+		if (!fence) lines.push({ text: line, line: index + 1 });
+	});
+	return lines;
+}
+
+/** Folders whose files the vault declares read-only: hits there are reported, never rewritten. */
+const IMMUTABLE_LINK_DIRS = ['90-Reference'];
+
+/** Folders that hold vault machinery rather than notes: no link points at them, so a link check says nothing. */
+const PROTECTED_DELETE_DIRS = ['99-Templates'];
+
+function inFolders(rel, folders) {
+	return folders.some((folder) => rel === folder || rel.startsWith(folder + '/'));
+}
+
+/** Every `.md` under `dir`, dot folders skipped; bounded so a huge vault cannot stall the call. */
+async function collectMarkdown(dir, out, depth) {
+	if (depth > 24 || out.length >= LINK_SCAN_CAP) return;
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (out.length >= LINK_SCAN_CAP) return;
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (!entry.name.startsWith('.')) await collectMarkdown(full, out, depth + 1);
+		} else if (entry.isFile() && entry.name.endsWith('.md')) {
+			out.push(full);
+		}
+	}
+}
+
+/** The vault-relative form of an absolute path, the only form links and reports use. */
+function relPath(root, target) {
+	return path.relative(root, target).split(path.sep).join('/');
+}
+
+/** One line of a referrer, short: the caller shows these to a human, not the whole file. */
+function linkHit(rel, line, text) {
+	return { path: rel, line, text: text.trim().slice(0, 200) };
+}
+
+/**
+ * Read every note and collect the links that point at `target` — a folder
+ * includes what is inside it, which is how Obsidian links work: nobody links a
+ * folder, everyone links the notes inside it. `immutable` holds the hits the
+ * tool may not fix, so an upkeep that looks clean is not.
+ */
+async function scanLinks(root, target, folder, skip) {
+	const files = [];
+	await collectMarkdown(root, files, 0);
+	const referrers = [];
+	const immutable = [];
+	let scanned = 0;
+	let hits = 0;
+	let truncated = false;
+	for (const file of files) {
+		if (scanned >= LINK_SCAN_CAP) {
+			truncated = true;
+			break;
+		}
+		const rel = relPath(root, file);
+		// Deleting never counts the links that live INSIDE the deleted path:
+		// they go with it, and a self-reference must not look like a broken one.
+		if (skip && (rel === skip || rel.startsWith(skip + '/'))) continue;
+		scanned += 1;
+		let text;
+		try {
+			text = await readFile(file, 'utf8');
+		} catch {
+			continue;
+		}
+		for (const entry of proseLines(text)) {
+			LINK_PATTERN.lastIndex = 0;
+			let match;
+			while ((match = LINK_PATTERN.exec(entry.text))) {
+				if (!refersTo(linkPath(match[1]), target, folder)) continue;
+				hits += 1;
+				(inFolders(rel, IMMUTABLE_LINK_DIRS) ? immutable : referrers).push(linkHit(rel, entry.line, entry.text));
+			}
+		}
+	}
+	return {
+		hits,
+		scanned,
+		truncated,
+		referrers: referrers.slice(0, LINK_REPORT_CAP),
+		immutable: immutable.slice(0, LINK_REPORT_CAP),
+	};
+}
+
+/**
+ * Point every link at `target` to `newTarget` and write the files that changed.
+ * The rewrite touches only what the regex matched, and never a file under an
+ * immutable folder; `untouchable` reports those so the caller can stop and ask
+ * instead of believing the vault is consistent.
+ */
+async function applyLinkRewrite(root, target, newTarget, folder) {
+	const files = [];
+	await collectMarkdown(root, files, 0);
+	const changed = [];
+	const untouchable = [];
+	const failed = [];
+	let scanned = 0;
+	let truncated = false;
+	for (const file of files) {
+		if (scanned >= LINK_SCAN_CAP) {
+			truncated = true;
+			break;
+		}
+		const rel = relPath(root, file);
+		scanned += 1;
+		let text;
+		try {
+			text = await readFile(file, 'utf8');
+		} catch {
+			continue;
+		}
+		let hits = 0;
+		const rewrite = (whole, p, anchor = '', alias = '') => {
+			const clean = linkPath(p);
+			if (!refersTo(clean, target, folder)) return whole;
+			hits += 1;
+			const next = clean === target ? newTarget : newTarget + clean.slice(target.length);
+			return `[[${next}${anchor}${alias}]]`;
+		};
+		// The same prose rule as the scan: a link inside a code fence is an
+		// example, and an upkeep that edited examples would corrupt the very
+		// documents that teach the convention.
+		const lines = text.split('\n');
+		for (const entry of proseLines(text)) {
+			const nextLine = entry.text.replace(LINK_PATTERN, rewrite);
+			if (nextLine !== entry.text) lines[entry.line - 1] = nextLine;
+		}
+		const rewritten = lines.join('\n');
+		if (hits === 0) continue;
+		if (inFolders(rel, IMMUTABLE_LINK_DIRS)) {
+			untouchable.push({ path: rel, hits });
+			continue;
+		}
+		if (Buffer.byteLength(rewritten) > MAX_WRITE_BYTES) {
+			failed.push({ path: rel, reason: 'too-large' });
+			continue;
+		}
+		// Atomic, like every other vault write: a reader never sees half a note.
+		const temp = path.join(path.dirname(file), '.' + path.basename(file) + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2, 8));
+		try {
+			await writeFile(temp, rewritten, 'utf8');
+			await rename(temp, file);
+			changed.push({ path: rel, hits });
+		} catch {
+			await rm(temp, { force: true }).catch(() => {});
+			failed.push({ path: rel, reason: 'write-denied' });
+		}
+	}
+	return {
+		changed,
+		untouchable,
+		failed,
+		scanned,
+		truncated,
+		hits: changed.reduce((sum, entry) => sum + entry.hits, 0) + untouchable.reduce((sum, entry) => sum + entry.hits, 0),
+	};
 }
 
 /**
@@ -575,9 +796,45 @@ function writeTool(ctx, config) {
 /** Model-facing contract of the move tool; short because it is read on every request. */
 const MOVE_TOOL_DESCRIPTION =
 	'Rename or move one file or folder inside the vault: both paths are relative to the vault root and ' +
-	'neither can leave it, and a folder moves with everything under it. The move does not rewrite links or ' +
-	'backlinks written in other notes, so say that when the note is linked elsewhere. Needs the user’s ' +
-	'Vault Grant.';
+	'neither can leave it, and a folder moves with everything under it. The `[[…]]` links that point at the ' +
+	'old path are kept correct by this tool: by default every `[[old]]` and `[[old/…]]` in the vault becomes ' +
+	'the new path, code fences excluded, and the answer lists the files it changed. Pass links "report" to ' +
+	'move without rewriting and list the referrers instead, or dryRun to see the plan without touching ' +
+	'anything. Hits inside an immutable folder are reported, never rewritten. Needs the user’s Vault Grant.';
+
+/** Collapse per-line link hits into one entry per file, for the compact `untouchable` list. */
+function foldHits(entries) {
+	const byPath = new Map();
+	for (const entry of entries) byPath.set(entry.path, (byPath.get(entry.path) ?? 0) + 1);
+	return [...byPath].map(([hitPath, hits]) => ({ path: hitPath, hits }));
+}
+
+/**
+ * The link part of a move answer, in the one shape each kind needs. `plan` says
+ * what a dry run would rewrite, `applied` what it did rewrite, `report` what is
+ * left pointing at the old path. The scan and the rewrite return different
+ * fields, so the kind is passed in rather than guessed from what is missing.
+ */
+function upkeepFields(mode, kind, data) {
+	if (mode === 'off') return { linksMode: 'off' };
+	const immutable = data.immutable ? foldHits(data.immutable) : (data.untouchable ?? []);
+	const fields = {
+		linksMode: mode,
+		linksScanned: data.scanned,
+		...(data.truncated ? { linksTruncated: true } : {}),
+		...(immutable.length ? { untouchable: immutable } : {}),
+	};
+	if (kind === 'applied') {
+		if (data.changed.length) fields.changed = data.changed;
+		if (data.failed.length) fields.failed = data.failed;
+	} else if (kind === 'plan') {
+		const would = foldHits([...data.referrers, ...data.immutable]);
+		if (would.length) fields.changed = would;
+	} else if (data.referrers.length) {
+		fields.referrers = data.referrers;
+	}
+	return fields;
+}
 
 function moveTool(ctx, config) {
 	return {
@@ -589,6 +846,12 @@ function moveTool(ctx, config) {
 				from: { type: 'string', description: 'Existing file or folder inside the vault root, relative to it.' },
 				to: { type: 'string', description: 'New path inside the vault root, relative to it. A path in the same folder is a pure rename.' },
 				overwrite: { type: 'boolean', description: 'True replaces an existing file at the target. A folder is never merged into or replaces another folder.' },
+				links: {
+					type: 'string',
+					enum: ['auto', 'report', 'off'],
+					description: 'What to do with the `[[…]]` links pointing at the old path. Default "auto" rewrites them; "report" leaves them and lists the referrers; "off" does neither.',
+				},
+				dryRun: { type: 'boolean', description: 'True reports what the move and the link upkeep would do, without touching the vault. Reading needs no grant.' },
 			},
 			required: ['from', 'to'],
 			additionalProperties: false,
@@ -602,26 +865,84 @@ function moveTool(ctx, config) {
 					kind: { type: 'string', enum: ['file', 'directory'], description: 'What moved.' },
 					action: { type: 'string', enum: ['renamed', 'moved'], description: 'Renamed keeps the parent folder, moved changes it.' },
 					replaced: { type: 'boolean', description: 'True when an existing file at the target was replaced.' },
+					dryRun: { type: 'boolean', description: 'True when nothing was touched: the answer is the plan.' },
+					linksMode: { type: 'string', enum: ['auto', 'report', 'off'], description: 'The link behaviour that was applied.' },
+					linksScanned: { type: 'integer', description: 'Notes read to look for links.' },
+					linksTruncated: { type: 'boolean', description: 'True when the scan stopped at its cap: the vault is bigger than the sample.' },
+					changed: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, hits: { type: 'integer' } },
+							additionalProperties: false,
+						},
+						description: 'Notes whose links were rewritten, and how many each held.',
+					},
+					referrers: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, line: { type: 'integer' }, text: { type: 'string' } },
+							additionalProperties: false,
+						},
+						description: 'Notes still pointing at the old path, as file:line samples.',
+					},
+					untouchable: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, hits: { type: 'integer' } },
+							additionalProperties: false,
+						},
+						description: 'Notes holding links the tool may not rewrite (immutable folders). They stay broken: ask the user.',
+					},
+					failed: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, reason: { type: 'string' } },
+							additionalProperties: false,
+						},
+						description: 'Notes whose link rewrite did not happen; the move itself is already done.',
+					},
 					root: { type: 'string', description: 'Absolute vault root both paths are under.' },
 					error: { type: 'string', description: 'Refusal reason, when nothing moved.' },
 					hint: { type: 'string', description: 'What to do instead, when nothing moved.' },
 				},
 				additionalProperties: false,
 			},
-			render: (args, value) => [
-				{
-					type: 'text',
-					text: value.error
-						? `vault_move refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
-						: `vault_move ${value.action} ${value.from} → ${value.to} (${value.kind}${value.replaced === true ? ', replacing the file that was there' : ''})`,
-				},
-			],
+			render: (args, value) => {
+				if (value.error) {
+					return [{ type: 'text', text: `vault_move refused (${value.error}): ${value.hint ?? ''}`.trimEnd() }];
+				}
+				const upkeep =
+					value.linksMode === 'off'
+						? ''
+						: value.linksMode === 'auto'
+							? ` | links: ${(value.changed ?? []).reduce((sum, entry) => sum + entry.hits, 0)} ${value.dryRun ? 'would be rewritten' : 'rewritten'} in ${(value.changed ?? []).length} notes`
+							: ` | links: ${(value.referrers ?? []).length} notes still point at the old path`;
+				const verb = value.dryRun ? (value.action === 'renamed' ? 'rename' : 'move') : value.action;
+				return [
+					{
+						type: 'text',
+						text:
+							`${value.dryRun ? 'vault_move would ' : 'vault_move '}${verb} ${value.from} → ${value.to} (${value.kind}${value.replaced === true ? ', replacing the file that was there' : ''})` +
+							`${value.untouchable?.length ? ` | ${value.untouchable.length} notes hold links this tool may not fix` : ''}` +
+							`${value.failed?.length ? ` | links FAILED in ${value.failed.length} notes` : ''}` +
+							upkeep,
+					},
+				];
+			},
 		},
 		isConcurrencySafe: () => false,
 		async execute(args, exec) {
-			const gate = await mutationGate(ctx, config, exec, 'vault_move');
+			const dry = args.dryRun === true;
+			// A plan only reads the vault, so it runs without the grant: the user can
+			// see the blast radius of a move before deciding anything.
+			const gate = dry ? await readGate(ctx, config) : await mutationGate(ctx, config, exec, 'vault_move');
 			if (gate.error) return gate;
 			const root = gate.root;
+			const linksMode = args.links === 'report' || args.links === 'off' ? args.links : 'auto';
 			const source = await confinePath(root, args.from);
 			if (source.error) return { error: source.error, hint: PATH_HINT };
 			const target = await confinePath(root, args.to);
@@ -636,6 +957,23 @@ function moveTool(ctx, config) {
 			const there = await probe(target.target);
 			if (there.directory) return { error: 'target-is-directory', hint: 'The target is a folder, and folders are never merged: choose a name inside it.' };
 			if (there.exists && args.overwrite !== true) return { error: 'exists', hint: 'Choose another target, or pass overwrite: true to replace that file.' };
+			const fromRel = relPath(root, source.target);
+			const toRel = relPath(root, target.target);
+			// Links carry no extension, so upkeep compares and writes the key form:
+			// `30-Resources/parigi`, never `30-Resources/parigi.md`.
+			const fromKey = linkPath(fromRel);
+			const toKey = linkPath(toRel);
+			const shape = {
+				from: fromRel,
+				to: toRel,
+				kind: here.directory ? 'directory' : 'file',
+				action: path.dirname(source.target) === path.dirname(target.target) ? 'renamed' : 'moved',
+				root,
+			};
+			if (dry) {
+				const plan = await scanLinks(root, fromKey, here.directory);
+				return { ...shape, dryRun: true, ...upkeepFields(linksMode, linksMode === 'report' ? 'report' : 'plan', plan) };
+			}
 			// Both paths are verified again immediately before the syscall, exactly
 			// as the write does: the verified paths must be the ones `rename` sees.
 			const freshFrom = await confinePath(root, args.from);
@@ -650,14 +988,12 @@ function moveTool(ctx, config) {
 			} catch (error) {
 				return failureOf(error, there.exists ? 'target' : 'source');
 			}
-			return {
-				from: path.relative(root, freshFrom.target).split(path.sep).join('/'),
-				to: path.relative(root, freshTo.target).split(path.sep).join('/'),
-				kind: here.directory ? 'directory' : 'file',
-				action: path.dirname(freshFrom.target) === path.dirname(freshTo.target) ? 'renamed' : 'moved',
-				...(there.exists ? { replaced: true } : {}),
-				root,
-			};
+			const moved = { ...shape, ...(there.exists ? { replaced: true } : {}) };
+			if (linksMode === 'off') return { ...moved, linksMode };
+			// The rename is the fact; the upkeep follows it, so a failed rewrite leaves
+			// a correctly moved file with stale links — reported, not hidden.
+			const upkeep = linksMode === 'auto' ? await applyLinkRewrite(root, fromKey, toKey, here.directory) : await scanLinks(root, fromKey, here.directory);
+			return { ...moved, ...upkeepFields(linksMode, linksMode === 'auto' ? 'applied' : 'report', upkeep) };
 		},
 	};
 }
@@ -665,8 +1001,11 @@ function moveTool(ctx, config) {
 /** Model-facing contract of the delete tool: the destructive one, so its cost is stated up front. */
 const DELETE_TOOL_DESCRIPTION =
 	'Delete one file or folder inside the vault root. There is no trash and no undo: the content is gone, ' +
-	'and a folder takes everything under it with it. Needs the user’s Vault Grant, and a confirm only the ' +
-	'user can give for that exact path.';
+	'and a folder takes everything under it. The `[[…]]` links are checked first. Nothing points at the ' +
+	'path → a file goes at once. Something points at it → refused with the referrers, and force only after ' +
+	'the user saw them and chose to go ahead. A folder, or anything in the vault’s template folders, always ' +
+	'needs a confirm the user gave for that exact path: links point at the notes inside a folder, never at ' +
+	'the folder, so a clean check says nothing about it. Needs the user’s Vault Grant.';
 
 function deleteTool(ctx, config) {
 	return {
@@ -677,7 +1016,8 @@ function deleteTool(ctx, config) {
 			properties: {
 				path: { type: 'string', description: 'File or folder inside the vault root, relative to it.' },
 				recursive: { type: 'boolean', description: 'True deletes a folder together with everything under it. Never needed for a file.' },
-				confirm: { type: 'boolean', description: 'Must be true, and only after the user agreed to delete this exact path.' },
+				confirm: { type: 'boolean', description: 'Must be true for a folder or a template folder, and only after the user agreed to delete this exact path.' },
+				force: { type: 'boolean', description: 'True deletes although notes link this path. Only after the user was shown the referrers and chose to proceed.' },
 			},
 			required: ['path'],
 			additionalProperties: false,
@@ -689,6 +1029,27 @@ function deleteTool(ctx, config) {
 					path: { type: 'string', description: 'Deleted path, relative to the vault root.' },
 					kind: { type: 'string', enum: ['file', 'directory'], description: 'What was deleted.' },
 					entries: { type: 'integer', description: 'How many entries a deleted folder held.' },
+					linksScanned: { type: 'integer', description: 'Notes read for the link check.' },
+					linksTruncated: { type: 'boolean', description: 'True when the scan stopped at its cap: the check is partial.' },
+					referrers: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, line: { type: 'integer' }, text: { type: 'string' } },
+							additionalProperties: false,
+						},
+						description: 'Notes that link this path, as file:line samples. Show them to the user.',
+					},
+					untouchable: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, hits: { type: 'integer' } },
+							additionalProperties: false,
+						},
+						description: 'Links inside immutable folders: nothing can rewrite them, so deleting leaves a broken reference for good.',
+					},
+					forced: { type: 'boolean', description: 'True when links existed and the caller forced the delete.' },
 					root: { type: 'string', description: 'Absolute vault root the path is under.' },
 					error: { type: 'string', description: 'Refusal reason, when nothing was deleted.' },
 					hint: { type: 'string', description: 'What to do instead, when nothing was deleted.' },
@@ -700,7 +1061,7 @@ function deleteTool(ctx, config) {
 					type: 'text',
 					text: value.error
 						? `vault_delete refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
-						: `vault_delete deleted ${value.path} (${value.kind}${value.entries === void 0 ? '' : `, ${value.entries} entries`})`,
+						: `vault_delete deleted ${value.path} (${value.kind}${value.entries === void 0 ? '' : `, ${value.entries} entries`}${value.forced ? ', linked notes were forced' : ''})`,
 				},
 			],
 		},
@@ -715,6 +1076,7 @@ function deleteTool(ctx, config) {
 			const at = await probe(confined.target);
 			if (!at.exists) return { error: 'not-found', hint: 'Nothing was deleted.' };
 			if (at.directory && args.recursive !== true) return { error: 'is-directory', hint: 'Pass recursive: true to delete the folder and everything under it.' };
+			const rel = relPath(root, confined.target);
 			let entries;
 			if (at.directory) {
 				try {
@@ -723,8 +1085,35 @@ function deleteTool(ctx, config) {
 					entries = void 0;
 				}
 			}
-			// The user’s agreement is the last gate before the removal.
-			if (args.confirm !== true) return { error: 'needs-confirm', hint: 'Ask the user to confirm deleting this exact path, then repeat with confirm: true.' };
+			// The link check runs before any agreement is asked for: an orphan file is
+			// routine debris and goes without a round trip, while a linked one is a
+			// decision about other notes and belongs to the user.
+			const links = await scanLinks(root, linkPath(rel), at.directory, rel);
+			const linkFields = {
+				linksScanned: links.scanned,
+				...(links.truncated ? { linksTruncated: true } : {}),
+				...(links.referrers.length ? { referrers: links.referrers } : {}),
+				...(links.immutable.length ? { untouchable: foldHits(links.immutable) } : {}),
+			};
+			if (links.hits > 0 && args.force !== true) {
+				return {
+					error: 'linked',
+					hint: `${links.hits} link${links.hits === 1 ? '' : 's'} in ${new Set([...links.referrers, ...links.immutable].map((hit) => hit.path)).size} note${new Set([...links.referrers, ...links.immutable].map((hit) => hit.path)).size === 1 ? '' : 's'} still point here. Show them to the user: move or rewrite the referrers first, or delete with force: true if the user accepts the broken links.`,
+					...linkFields,
+				};
+			}
+			// A folder or a template folder is worth a confirm even when nothing links
+			// it, and the user’s agreement stays the last gate before the removal.
+			const structural = at.directory || inFolders(rel, PROTECTED_DELETE_DIRS);
+			if (structural && args.confirm !== true) {
+				return {
+					error: 'needs-confirm',
+					hint: at.directory
+						? `This is a folder (${entries ?? 'unknown'} entries inside). Nothing links it, but a folder holds its whole subtree: ask the user to confirm this exact path, then repeat with confirm: true.`
+						: 'This sits in a folder the vault uses as machinery, not as a note: ask the user to confirm this exact path, then repeat with confirm: true.',
+					...linkFields,
+				};
+			}
 			const fresh = await confinePath(root, args.path);
 			if (fresh.error || fresh.target !== confined.target) return { error: 'outside-root', hint: 'The path changed while deleting; nothing was deleted.' };
 			try {
@@ -733,9 +1122,11 @@ function deleteTool(ctx, config) {
 				return failureOf(error, 'target');
 			}
 			return {
-				path: path.relative(root, fresh.target).split(path.sep).join('/'),
+				path: relPath(root, fresh.target),
 				kind: at.directory ? 'directory' : 'file',
 				...(entries === void 0 ? {} : { entries }),
+				...(links.hits > 0 ? { forced: true } : {}),
+				...linkFields,
 				root,
 			};
 		},

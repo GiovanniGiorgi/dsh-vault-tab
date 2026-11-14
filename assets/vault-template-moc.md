@@ -12,4 +12,4 @@ summary: ""
 
 ## <optional group>
 
-- [[]] — 
+- [[<path/from/vault/root>]] — <one-line annotation>

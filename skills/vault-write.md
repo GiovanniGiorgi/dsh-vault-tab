@@ -1,6 +1,6 @@
 ---
 name: vault-write
-description: Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); create, replace, rename/move with link upkeep, deletion behind a link check; the Vault Grant and what to do when writing is refused.
+description: Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); one link form; create, replace, rename/move with automatic link upkeep, deletion behind a link check; the Vault Grant and what to do when writing is refused.
 ---
 
 # Writing into the vault
@@ -23,7 +23,21 @@ memory, and never let the user be the one who remembers the policy.
    that text as binding for this change; tell the user the vault has no policy of
    its own and that **vault-setup** can persist the default at the root.
 
-## 2. Creating and replacing
+## 2. The link form: one shape, always
+
+Internal links are `[[path/from/the/vault/root]]` and nothing else: from the root,
+**no** `.md`, **no** `|alias`, **no** `#anchor`, **no** short names, **no**
+`[text](relative.md)`. Embeds use the same path with `!`:
+`![[30-Resources/img/mappa.png]]`. This is the one form the tools keep correct when
+notes move or die; anything else silently rots.
+
+- Every link you write: absolute wiki, no exceptions. A link in another shape you
+  happen to find in a note is an **error to fix**, not a form to imitate: fix it
+  when you are editing that line anyway, and never add new ones.
+- Links that leave the vault — `https://…`, `mailto:` — are not
+  vault links: nobody rewrites them, leave them exactly as they are.
+
+## 3. Creating and replacing
 
 `vault_write { path, content, overwrite? }` — `path` relative to the vault root
 (`30-Resources/citta/parigi.md`), `content` the **complete** file (UTF-8, ≤ 1 MiB).
@@ -34,43 +48,47 @@ and nothing is written.
 Writing a note is usually two writes: the note itself and the index line the policy
 requires (its MOC). Finish the job the policy started, same rules, same order.
 
-## 3. Renaming and moving
+## 4. Renaming and moving
 
-`vault_move { from, to, overwrite? }` — both paths relative to the vault root; a
-folder moves with everything under it. Folders never merge or replace (`target-is-directory`);
-`overwrite: true` replaces an existing **file** at the target only.
+`vault_move { from, to, overwrite?, links?, dryRun? }` — both paths relative to the
+vault root; a folder moves with everything under it. Folders never merge or replace
+(`target-is-directory`); `overwrite: true` replaces an existing **file** only.
 
-Moves do **not** rewrite links, and vault links are written as paths from the root:
-an un-updated reference silently points at nothing. So the move is a three-step job:
+Link upkeep is the tool's job, not yours: by default (`links: 'auto'`) every
+`[[old]]` and `[[old/…]]` in the vault becomes the new path — code fences and
+immutable `90-Reference/` material excluded — and the answer lists the notes it
+changed and how many links each held. `dryRun: true` shows that plan without
+touching the vault and needs no grant; `links: 'report'` moves without rewriting
+and lists what still points at the old path; `links: 'off'` does neither. Your
+part is deciding when to stop, not how to search:
 
-1. Before moving, grep the vault for what points at the old path — `[[<old path]]`,
-   `[[<old path>|…]]` and the bare name, in `*.md` everywhere (reads cost nothing).
-2. `vault_move`.
-3. Update every referring note and MOC line with `vault_write` (read + `overwrite`),
-   and the links **inside** the moved file when the policy writes them relative to
-   its old position.
+- `untouchable` — links inside material the policy forbids editing. The tool will
+  not fix them and they stay broken: stop, list them, ask the user.
+- `failed` — the move is already done and these notes kept stale links: finish what
+  can be fixed and say plainly what is still broken.
+- The meaning: a renamed project, a MOC line that must be added where the old one
+  was dropped, a note whose body says something false once it moves.
 
-If some references sit where the policy forbids edits (e.g. immutable
-`90-Reference/` material), stop before the move, list them, and ask the user how to
-proceed. Report every file the move forced you to touch.
+## 5. Deleting
 
-## 4. Deleting
+`vault_delete { path, recursive?, confirm?, force? }` — no trash: the removal is
+immediate and final. The link check runs **inside** the tool, before anything goes:
 
-`vault_delete { path, recursive?, confirm }` — no trash: the removal is immediate
-and final. So links are checked **before** anything disappears, and a note that is
-pointed at is never silently orphaned:
+- Nothing points at the path → a **file** is deleted at once. That is the debris
+  case, your own scratch and test notes; report what went.
+- `linked` → the answer lists the referrers as `path:line`. Show them and ask how
+  to proceed — remove those lines too, keep the note, or move it to `40-Archive/` —
+  then finish the whole agreed set. `force: true` only after the user chose to
+  accept the broken links.
+- Links written inside the deleted path do not count: they go with it. What counts
+  is what lives **outside** and would point at nothing.
+- A **folder**, or anything under `99-Templates/`, always needs `confirm: true` the
+  user gave for that exact path: links point at the notes *inside* a folder, never
+  at the folder, so a clean check says nothing about it. A folder also needs
+  `recursive: true`, and the answer reports how many entries went with it.
+- The vault root itself can never be deleted.
 
-1. Grep the vault for links to the path (as in §3).
-2. **Any hit → stop.** List the referrers and ask the user how to proceed — remove
-   the lines too, clean and keep the note, or move it to `40-Archive/` instead —
-   then finish the whole agreed set, referrers included.
-3. No hits → ask the user to confirm this exact path (unless they already named it
-   in the request) and pass `confirm: true`.
-4. Folders need `recursive: true` and a double look: count the contents first
-   (glob), check the policy allows deleting that subtree, and confirm with the user
-   anyway. The vault root itself can never be deleted.
-
-## 5. The Vault Grant
+## 6. The Vault Grant
 
 Changing the vault needs the user's **Vault** control, in the composer beside the
 permission selector: Read Only never writes; Workspace Write writes only while the
