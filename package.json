@@ -1,9 +1,9 @@
 {
 	"name": "@local/dsh-vault-tab",
-	"version": "1.8.0",
+	"version": "1.9.0",
 	"private": true,
 	"type": "module",
-	"description": "Vault tab: list the configured vault folder, write into it with the vault_* tools (create, move with link upkeep, delete behind a link check), and a Vault Grant control in the composer.",
+	"description": "Vault tab: list the configured vault folder, search and read it (grep-first over names and summaries), write into it with the vault_* tools (note from template with lint, move with link upkeep, delete behind a link check) gated by a per-session Vault Grant.",
 	"dependencies": {
 		"@deepseek-ai/schemastery": "^3.18.5"
 	},
@@ -33,5 +33,8 @@
 				"@deepseek-ai/dsh-client-ui-sidebar-right"
 			]
 		}
+	},
+	"scripts": {
+		"test": "node test/vault-tools.test.mjs && node test/link-engine.test.mjs && node test/link-canonical.test.mjs"
 	}
 }

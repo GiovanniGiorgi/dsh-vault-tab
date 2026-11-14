@@ -1,6 +1,6 @@
 // Host half of @local/dsh-vault-tab.
 //
-// Two capabilities live here:
+// Three capabilities live here, and they are deliberately not equally gated:
 //
 // 1. The Vault tab listing: one exact JSON route listing one level of the
 //    configured root. An unset root falls back to `<home>/Vault`, so a fresh
@@ -10,15 +10,27 @@
 //    not go through this route: the Client opens the built-in Document viewer,
 //    whose reads follow the Session's own file-read authority.
 //
-// 2. Vault setup: the `vault_setup` tool plus the `vault-setup` skill. Plugin
-//    Host code runs in the Host process, outside both enforcement points the
-//    sandbox has (the `ctx.fs` policy fence and the confined `ctx.shell`
-//    runners), so this is the only path that can scaffold a vault folder while
-//    the Session is `read-only` or `workspace-write`. The tool is therefore the
-//    single place where the vault boundary is decided; the skill only explains
-//    the order of operations, and the user is asked before anything is written.
+// 2. Vault write: `vault_write`, `vault_note`, `vault_move`, `vault_delete`,
+//    `vault_setup`, plus the `vault-setup` and `vault-write` skills. Plugin Host
+//    code runs in the Host process, outside both enforcement points the sandbox
+//    has (the `ctx.fs` policy fence and the confined `ctx.shell` runners), so
+//    this is the only path that can change a vault folder while the Session is
+//    `read-only` or `workspace-write`. The tools are therefore the single place
+//    where the vault boundary is decided — the user's Vault Grant, the
+//    confirmations, and the policy budgets of the notes themselves (a summary
+//    too long to stay a retrieval key, a note that stopped being atomic); the
+//    skills only explain the order of operations, and the user is asked before
+//    anything is written or removed.
+//
+// 3. Vault read: `vault_search` and `vault_read`, with the `vault-read` skill.
+//    Reading is not a permission, so this capability asks for nothing but a tool
+//    slot and never consults the Grant. It exists because the retrieval the
+//    vault policy describes is a discipline a raw `grep` does not enforce: grep
+//    the metadata (names and `summary:`) before the content, return the smallest
+//    answer that decides the next step, keep `90-Reference/` out of the search
+//    and enter long documents in regions.
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -481,6 +493,682 @@ async function confinePath(root, rel) {
 	}
 }
 
+// --- Vault retrieval ---------------------------------------------------------
+//
+// Reading the vault is not a permission: these helpers answer in every session
+// mode and never consult the Vault Grant. They exist because the retrieval the
+// policy describes (§3) is a discipline — grep the metadata before the content,
+// read only what you selected, keep `90-Reference/` out of the search — and a
+// model holding a raw `grep` breaks it: whole folders read, a 4000-line
+// reference loaded to answer one question, `città` searched with `citta`. Each
+// helper does one grep-first step and returns the smallest answer that lets the
+// next step be decided.
+
+/** Files one search walks at most; a bigger tree reports `truncated`. */
+const SEARCH_SCAN_CAP = 6000;
+
+/** Rows one search returns; the total is exact, the list is the best `limit`. */
+const SEARCH_ROW_CAP = 60;
+
+/** Lines `vault_read` returns when it was asked for none. */
+const READ_DEFAULT_LINES = 120;
+
+/** Lines `vault_read` returns at most: a whole reference document never fits in one answer. */
+const READ_MAX_LINES = 400;
+
+/** Bytes one file may hold to be read by the full-text search. */
+const SEARCH_FILE_BYTES = 1 << 21;
+
+/** Bytes of text `vault_read` returns at most, whatever the line counts are. */
+const READ_TEXT_CAP = 96 * 1024;
+
+/** Folders the policy keeps out of retrieval: §7 (integral sources) and §8 (templates). */
+const SEARCH_EXCLUDE = ['90-Reference', '99-Templates'];
+
+/** Extensions the full-text search reads. The metadata scan is Markdown only. */
+const SEARCH_TEXT_EXTS = new Set(['.md', '.txt', '.log', '.json', '.csv', '.yaml', '.yml']);
+
+/** `summary` budgets (policy §1): the target, and the maximum nothing may pass. */
+const SUMMARY_TARGET = 100;
+const SUMMARY_MAX = 140;
+
+/** One concept per note, ~50 lines (policy §2). Measured on the real vault: 23 of 308 above it. */
+const NOTE_LINE_TARGET = 50;
+
+/** Code points in a string, so an emoji counts as one and a budget means what it says. */
+function textLength(value) {
+	return Array.from(String(value ?? '')).length;
+}
+
+/**
+ * Fold accents and case away: the vault is searched the way the policy says,
+ * `citta` finding `città`. `NFKD` splits ligatures too, and the combining marks
+ * left behind are dropped. Folding the haystack rather than the keyword is what
+ * makes one comparison enough — plain `grep` cannot do this, which is why the
+ * old vault carried a `sed` recipe for it.
+ */
+function foldText(value) {
+	return String(value ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+/** Decoration the vault keeps out of its retrieval keys. Arrows are not emoji: `→` stays legal. */
+const EMOJI_PATTERN = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/u;
+
+/** `kebab-case.md`; a dated note may carry the `YYYY-MM-DD-` prefix (policy §2). The seeded
+ * home index is the one canonical name with a capital, so it is allowed by name. */
+const KEBAB_NAME = /^([a-z0-9][a-z0-9._-]*|00-Home)\.md$/;
+
+/** A policy file is vault machinery, not a note: the root one and any section policy. */
+function isPolicyFile(rel) {
+	return String(rel ?? '').split('/').pop() === 'POLICY.md';
+}
+
+/**
+ * The frontmatter block of a note: `fields` holds the top-level `key: value`
+ * pairs with quotes removed, `end` is the 1-based line the closing `---` sits on
+ * (0 when the block never closes). No YAML parser on purpose: the vault schema is
+ * flat by policy (§1), and a real parser would disagree with Obsidian at the
+ * edges we cannot change.
+ */
+function frontmatterOf(text) {
+	const lines = String(text ?? '').split('\n');
+	if ((lines[0] ?? '').trim() !== '---') return { present: false, closed: false, fields: {}, end: 0 };
+	const fields = {};
+	let end = 0;
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (line.trim() === '---') {
+			end = i + 1;
+			break;
+		}
+		if (!/^[A-Za-z0-9_-]+:/.test(line)) continue;
+		const at = line.indexOf(':');
+		let value = line.slice(at + 1).trim();
+		if (value.length > 1 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) value = value.slice(1, -1);
+		fields[line.slice(0, at).trim()] = value;
+	}
+	return { present: true, closed: end > 0, fields, end };
+}
+
+/** The `summary` of a note, or `''`. It is the retrieval key, so every read path wants it. */
+function summaryOf(text) {
+	return frontmatterOf(text).fields.summary ?? '';
+}
+
+/** The keywords of one call, split, deduplicated, folded once for every comparison. */
+function normalizeKeywords(input) {
+	const list = Array.isArray(input) ? input : [input];
+	const out = [];
+	for (const item of list) {
+		for (const word of String(item ?? '').split(/[\s,]+/)) {
+			const clean = word.trim();
+			if (clean && !out.includes(clean)) out.push(clean);
+		}
+	}
+	return out.slice(0, 8);
+}
+
+/**
+ * Every file and folder under `dir`, as vault-relative paths, sorted for a
+ * stable answer. Dot folders are pruned (`.git` holds no notes), `exclude` prunes
+ * what the policy keeps out of search, and the cap bounds one call on a tree that
+ * grew past the vault's meaning.
+ */
+async function collectVaultFiles(root, options = {}) {
+	const { scope = '', extensions = null, exclude = [], cap = SEARCH_SCAN_CAP } = options;
+	const base = scope ? path.join(root, scope) : root;
+	const files = [];
+	const folders = [];
+	let truncated = false;
+	const walk = async (dir, depth) => {
+		if (depth > 24) return;
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (files.length >= cap) {
+				truncated = true;
+				return;
+			}
+			const full = path.join(dir, entry.name);
+			const rel = relPath(root, full);
+			if (entry.isDirectory()) {
+				if (entry.name.startsWith('.')) continue;
+				if (exclude.some((folder) => rel === folder || rel.startsWith(folder + '/'))) continue;
+				folders.push(rel);
+				await walk(full, depth + 1);
+			} else if (entry.isFile() && (!extensions || extensions.has(path.extname(entry.name).toLowerCase()))) {
+				files.push(rel);
+			}
+		}
+	};
+	await walk(base, 0);
+	files.sort();
+	folders.sort();
+	return { files, folders, truncated };
+}
+
+/** The first bytes of a file: enough for frontmatter, cheap on a long document. */
+async function readHead(file, bytes = 4096) {
+	let handle;
+	try {
+		handle = await open(file, 'r');
+		const buffer = Buffer.alloc(bytes);
+		const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+		return buffer.subarray(0, bytesRead).toString('utf8');
+	} catch {
+		return '';
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
+
+/** The MOC of one folder: `00-<folder>.md` when it exists, else the first `00-*.md` there. */
+async function mocOfFolder(dir) {
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return '';
+	}
+	const indexes = entries.filter((entry) => entry.isFile() && entry.name.startsWith('00-') && entry.name.endsWith('.md')).map((entry) => entry.name);
+	if (!indexes.length) return '';
+	return indexes.find((name) => name === `00-${path.basename(dir)}.md`) ?? [...indexes].sort()[0];
+}
+
+/**
+ * The index that owns a note: the MOC inside its folder, else the nearest
+ * ancestor MOC, else the root home (§5: every note is reachable from an index).
+ * Walking up is how a note in `30-Resources/citta/giappone/tokyo/` finds
+ * `00-tokyo.md` instead of landing on Home.
+ */
+async function indexForFolder(root, folderRel) {
+	const segments = String(folderRel ?? '').split('/').filter(Boolean);
+	for (;;) {
+		const dir = segments.length ? path.join(root, ...segments) : root;
+		const name = await mocOfFolder(dir);
+		if (name) return { path: [...segments, name].join('/'), level: segments.length ? 'section' : 'home' };
+		if (!segments.length) return null;
+		segments.pop();
+	}
+}
+
+/**
+ * The vault's path index for one lint pass: note keys without extension, folder
+ * paths, and how many notes share each file name — which is the difference
+ * between a short link Obsidian still resolves and one that points at nothing.
+ */
+async function buildPathIndex(root) {
+	const found = await collectVaultFiles(root, { cap: LINK_SCAN_CAP });
+	const keys = new Set(found.files.filter((rel) => rel.endsWith('.md')).map((rel) => rel.slice(0, -3)));
+	const unique = new Map();
+	for (const key of keys) {
+		const base = key.split('/').pop();
+		unique.set(base, (unique.get(base) ?? 0) + 1);
+	}
+	return { keys, folders: new Set(found.folders), unique, scanned: keys.size, truncated: found.truncated };
+}
+
+/** Blank out inline code spans, so `[[nodiscard]]` written as code is not read as a link. */
+function maskInlineCode(line) {
+	return line.replace(/`[^`\n]*`/g, (span) => ' '.repeat(span.length));
+}
+
+/**
+ * Where the links of one note point. `broken` is nothing the vault holds;
+ * `notCanonical` is a short name Obsidian resolves today by unique-basename
+ * matching and the write rule forbids. Code fences and inline code are excluded —
+ * an example is not a link — and material the policy declares immutable is never
+ * reported, because nothing may fix it there.
+ */
+async function linkFindings(root, rel, text, index) {
+	if (inFolders(rel, [...IMMUTABLE_LINK_DIRS, ...PROTECTED_DELETE_DIRS]) || isPolicyFile(rel)) return { broken: [], notCanonical: [] };
+	const broken = new Set();
+	const notCanonical = new Set();
+	for (const entry of proseLines(text)) {
+		const line = maskInlineCode(entry.text);
+		LINK_PATTERN.lastIndex = 0;
+		let match;
+		while ((match = LINK_PATTERN.exec(line))) {
+			const target = linkPath(match[1]);
+			if (!target || target.includes('<') || target.includes('>') || target.includes('…')) continue;
+			if (target.startsWith('/') || target.split('/').includes('..')) {
+				broken.add(target);
+				continue;
+			}
+			if (index.keys.has(target) || index.folders.has(target)) continue;
+			const base = target.split('/').pop();
+			if (!target.includes('/') && index.unique.get(base) === 1) {
+				notCanonical.add(target);
+				continue;
+			}
+			// An attachment (`.png`, `.pdf`) is a file and not a note: ask the disk.
+			if (/\.[a-z0-9]{2,5}$/.test(base) && (await probe(path.join(root, target))).exists) continue;
+			broken.add(target);
+		}
+	}
+	return { broken: [...broken], notCanonical: [...notCanonical] };
+}
+
+/**
+ * The note budgets of the policy, checked instead of hoped for: `summary` as the
+ * retrieval key, one concept per note, kebab names without emoji, a MOC holding
+ * links only, no link pointing at nothing. `hard` is what the caller refuses —
+ * the summary maximum, which the real vault already respects 308 times out of
+ * 308, so a refusal catches a mistake and never a style. Everything else is a
+ * warning the caller can act on in the same change.
+ */
+async function lintNote(root, rel, text, index) {
+	if (!rel.endsWith('.md') || inFolders(rel, [...IMMUTABLE_LINK_DIRS, ...PROTECTED_DELETE_DIRS]) || isPolicyFile(rel)) {
+		return { hard: [], soft: [] };
+	}
+	const hard = [];
+	const soft = [];
+	const fm = frontmatterOf(text);
+	const base = rel.split('/').pop();
+	// An index is a MOC by type or by the `00-` convention (§2). It holds links,
+	// so the note schema and the atomicity budget do not apply to it.
+	const isMoc = fm.fields.type === 'moc' || base.startsWith('00-');
+
+	if (fm.present && !fm.closed) soft.push({ code: 'frontmatter-unclosed', message: 'The frontmatter block never closes: Obsidian will show it as text.' });
+	if (!fm.present) soft.push({ code: 'frontmatter-missing', message: 'No frontmatter block: the note is invisible to search and outside the schema (§1).' });
+
+	const summary = fm.fields.summary ?? '';
+	if (!summary) {
+		if (fm.present) soft.push({ code: 'summary-missing', message: '`summary:` is empty: `vault_search` reads it as the retrieval key, so this note will never be found (§1).' });
+	} else {
+		const length = textLength(summary);
+		if (length > SUMMARY_MAX) hard.push({ code: 'summary-too-long', message: `The summary is ${length} characters; the policy stops at ${SUMMARY_MAX}.`, examples: [summary] });
+		else if (length > SUMMARY_TARGET) soft.push({ code: 'summary-over-target', message: `The summary is ${length} characters; the target is ${SUMMARY_TARGET}. Descriptive richness belongs in the MOC annotation (§1).` });
+		if (EMOJI_PATTERN.test(summary)) soft.push({ code: 'emoji-in-key', message: 'The summary holds an emoji: retrieval is textual, decoration stays out of the vault (§2).' });
+	}
+
+	if (fm.present) {
+		for (const field of ['type', 'status', 'created']) {
+			if (!fm.fields[field]) soft.push({ code: 'frontmatter-field-missing', message: `\`${field}\` is empty or missing: every note carries it (§1).` });
+		}
+	}
+
+	const bodyLines = text.split('\n').length - (fm.closed ? fm.end : 0);
+	if (!isMoc && bodyLines > NOTE_LINE_TARGET) {
+		soft.push({ code: 'not-atomic', message: `${bodyLines} lines of body: one concept is ~${NOTE_LINE_TARGET}. Split it and link the parts, or keep the long material in 90-Reference/ (§2).` });
+	}
+
+	if (!KEBAB_NAME.test(base)) soft.push({ code: 'path-not-kebab', message: `\`${base}\` is not kebab-case ASCII without accents (§2).` });
+	const odd = rel
+		.split('/')
+		.slice(0, -1)
+		.filter((folder, depth) => !(depth === 0 && /^\d\d-[A-Z]/.test(folder)) && !/^[a-z0-9][a-z0-9._-]*$/.test(folder));
+	if (odd.length) soft.push({ code: 'path-not-kebab', message: `Folder names that are not kebab-case: ${odd.join(', ')} (§2).` });
+
+	if (isMoc) {
+		const prose = proseLines(text)
+			.filter((entry) => entry.line > fm.end)
+			.map((entry) => entry.text.trim())
+			.filter((line) => line && !/^#{1,6}\s/.test(line) && !/^[-*]\s/.test(line) && !/^_.*_$/.test(line));
+		if (prose.length) {
+			soft.push({ code: 'moc-has-prose', message: `A MOC is an index of links (§5): ${prose.length} line${prose.length === 1 ? '' : 's'} of argument belong in a note.`, examples: prose.slice(0, 3).map((line) => line.slice(0, 120)) });
+		}
+	}
+
+	const links = await linkFindings(root, rel, text, index);
+	if (links.broken.length) soft.push({ code: 'broken-link', message: `${links.broken.length} link${links.broken.length === 1 ? '' : 's'} point at nothing in the vault: create the target in the same change, or drop the link (§6).`, examples: links.broken.slice(0, 6) });
+	if (links.notCanonical.length) soft.push({ code: 'link-not-canonical', message: `${links.notCanonical.length} link${links.notCanonical.length === 1 ? '' : 's'} use a short name: write [[path/from/the/vault/root]], the form the tools keep correct.`, examples: links.notCanonical.slice(0, 6) });
+
+	return { hard, soft };
+}
+
+// --- Composing a note (the storage half) -------------------------------------
+
+/**
+ * A `kebab-case` file name out of a title: accents folded away (the vault searches
+ * without them), anything non-alphanumeric collapsed to `-`, plus the
+ * `YYYY-MM-DD-` prefix a log note carries. Never empty: `nota` keeps a note
+ * creatable even from a title made of punctuation.
+ */
+function slugifyTitle(title, options = {}) {
+	const slug = foldText(String(title ?? ''))
+		.replace(/&/g, ' and ')
+		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/-+/g, '-')
+		.replace(/^-|-$/g, '')
+		.slice(0, 60)
+		.replace(/-+$/, '');
+	const base = slug || 'nota';
+	return options.dated === true ? `${today()}-${base}` : base;
+}
+
+/** `{{date:YYYY-MM-DD}}` and friends, in the template syntax the vault already uses (§8). */
+function formatDate(pattern) {
+	const now = new Date();
+	const parts = {
+		YYYY: String(now.getFullYear()),
+		MM: String(now.getMonth() + 1).padStart(2, '0'),
+		DD: String(now.getDate()).padStart(2, '0'),
+	};
+	return String(pattern || 'YYYY-MM-DD').replace(/YYYY|MM|DD/g, (token) => parts[token]);
+}
+
+/** Fill the placeholders the templates use: `{{title}}`, `{{DATE}}`, `{{date:...}}`. */
+function fillPlaceholders(text, values) {
+	return String(text ?? '')
+		.replace(/\{\{\s*date:([^}]*)\}\}/g, (_all, pattern) => formatDate(String(pattern).trim()))
+		.replace(/\{\{\s*DATE\s*\}\}/g, today())
+		.replace(/\{\{\s*title\s*\}\}/g, values.title ?? '')
+		.replace(/\{\{\s*summary\s*\}\}/g, values.summary ?? '');
+}
+
+/** Quote a YAML scalar only when it needs it, keeping the vault's readable `source: https://…`. */
+function yamlValue(value) {
+	const text = String(value ?? '');
+	if (!text) return '';
+	const needsQuotes = /[:#\[{\]}"'`|>!*@&%]/.test(text) || /^[-?\s]/.test(text) || /\s$/.test(text);
+	return needsQuotes ? `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : text;
+}
+
+/**
+ * Set one top-level frontmatter key: the template's field order wins, a key the
+ * template never had is appended before the closing fence. Only lines starting at
+ * column zero count, so a list written under `tags:` keeps its shape.
+ */
+function setFrontmatterKey(text, key, value) {
+	const lines = String(text).split('\n');
+	const closing = lines.findIndex((line, i) => i > 0 && line.trim() === '---');
+	if (closing < 0) return String(text);
+	const isKey = new RegExp(`^${key}:(\\s|$)`);
+	const rendered = value === '' ? `${key}:` : `${key}: ${value}`;
+	for (let i = 1; i < closing; i++) {
+		if (!isKey.test(lines[i])) continue;
+		lines[i] = rendered;
+		return lines.join('\n');
+	}
+	lines.splice(closing, 0, rendered);
+	return lines.join('\n');
+}
+
+/** One MOC entry: the link form the upkeep engine keeps correct, plus a short annotation. */
+function mocEntryLine(key, annotation) {
+	const note = String(annotation ?? '').replace(/\s+/g, ' ').trim().slice(0, 90).replace(/[.\u2014-]+\s*$/, '');
+	return note ? `- [[${key}]] \u2014 ${note}` : `- [[${key}]]`;
+}
+
+/** Append one line to a MOC, touching nothing else in it. */
+function appendMocLine(text, line) {
+	const body = String(text).replace(/\s+$/, '');
+	return body ? `${body}\n${line}\n` : `${line}\n`;
+}
+
+/** The body of a note: heading from the title, then the model's text. */
+function noteBody(title, body) {
+	const tail = String(body ?? '').replace(/^\s+/, '').replace(/\s+$/, '');
+	return tail ? `# ${title}\n\n${tail}\n` : `# ${title}\n`;
+}
+
+// --- Reading: search, outline, region ----------------------------------------
+
+/**
+ * The grep-first search. Metadata by default — names and `summary:`, the two keys
+ * the policy defines — bodies only when asked for, and always the smallest row
+ * that lets the next step be decided. No keyword at all means inventory: what a
+ * folder holds, plus the index that owns it, which is the other half of
+ * navigation and the reason there is no fourth tool for browsing.
+ */
+async function searchVault(root, options = {}) {
+	const keywords = normalizeKeywords(options.keywords).map(foldText);
+	const where = options.where === 'fulltext' ? 'fulltext' : 'metadata';
+	const limit = Math.min(Math.max(1, Math.trunc(options.limit ?? 20)), SEARCH_ROW_CAP);
+	const scope = String(options.scope ?? '').replace(/^\/+/, '').replace(/\/+$/, '');
+	const wanted = options.type ? foldText(options.type) : '';
+	const excluded = SEARCH_EXCLUDE.filter((folder) => {
+		if (folder === '90-Reference' && options.includeReference === true) return false;
+		// A scope inside an excluded folder is a deliberate visit: policy §7 lets
+		// you deepen there, it only forbids stumbling on it while searching.
+		return !(scope && (scope === folder || scope.startsWith(folder + '/')));
+	});
+	const found = await collectVaultFiles(root, {
+		scope,
+		extensions: where === 'fulltext' ? SEARCH_TEXT_EXTS : new Set(['.md']),
+		exclude: excluded,
+	});
+	const shape = {
+		keywords: normalizeKeywords(options.keywords),
+		...(scope ? { scope } : {}),
+		scanned: found.files.length,
+		...(found.truncated ? { truncated: true } : {}),
+	};
+
+	if (where === 'fulltext') {
+		const scored = [];
+		for (const rel of found.files) {
+			const full = path.join(root, rel);
+			let text;
+			try {
+				const info = await stat(full);
+				if (info.size > SEARCH_FILE_BYTES) continue;
+				text = await readFile(full, 'utf8');
+			} catch {
+				continue;
+			}
+			const hay = foldText(text);
+			if (!keywords.every((keyword) => hay.includes(keyword))) continue;
+			// The frontmatter is what the metadata search already answers: prefer the
+			// lines of the body, and fall back to the first hit when the term only
+			// lives in the summary.
+			const start = frontmatterOf(text).end;
+			const lines = [];
+			const body = text.split('\n');
+			for (let i = start; i < body.length && lines.length < 3; i++) {
+				if (!keywords.some((keyword) => foldText(body[i]).includes(keyword))) continue;
+				lines.push({ line: i + 1, text: body[i].trim().slice(0, 200) });
+			}
+			if (!lines.length) {
+				const at = body.findIndex((line) => keywords.some((keyword) => foldText(line).includes(keyword)));
+				if (at >= 0) lines.push({ line: at + 1, text: body[at].trim().slice(0, 200) });
+			}
+			scored.push({ score: lines.length, row: { path: rel, hits: lines.length, lines } });
+		}
+		scored.sort((a, b) => b.score - a.score || a.row.path.localeCompare(b.row.path));
+		const results = scored.map((entry) => entry.row);
+		return {
+			mode: 'fulltext',
+			...shape,
+			total: results.length,
+			results,
+			hint: results.length
+				? 'Read only the region you need: vault_read { path, from: <line> } starts where a hit is.'
+				: fulltextMissHint(excluded, scope),
+		};
+	}
+
+	const scored = [];
+	for (const rel of found.files) {
+		const nameHay = foldText(rel.endsWith('.md') ? rel.slice(0, -3) : rel);
+		const fm = frontmatterOf(await readHead(path.join(root, rel)));
+		const summary = fm.fields.summary ?? '';
+		const summaryHay = foldText(summary);
+		let nameHits = 0;
+		let summaryHits = 0;
+		let ok = true;
+		for (const keyword of keywords) {
+			// AND across keywords, any order: every keyword must appear somewhere.
+			const inName = nameHay.includes(keyword);
+			const inSummary = summaryHay.includes(keyword);
+			if (!inName && !inSummary) {
+				ok = false;
+				break;
+			}
+			if (inName) nameHits += 1;
+			if (inSummary) summaryHits += 1;
+		}
+		if (!ok) continue;
+		if (wanted && foldText(fm.fields.type ?? '') !== wanted) continue;
+		const row = { path: rel };
+		if (summary) row.summary = summary;
+		if (keywords.length) {
+			const matched = [];
+			if (nameHits) matched.push('name');
+			if (summaryHits) matched.push('summary');
+			row.matched = matched;
+		}
+		if (fm.fields.status && fm.fields.status !== 'active') row.status = fm.fields.status;
+		scored.push({ score: nameHits * 3 + summaryHits, row });
+	}
+	scored.sort((a, b) => b.score - a.score || a.row.path.length - b.row.path.length || a.row.path.localeCompare(b.row.path));
+	const results = scored.slice(0, limit).map((entry) => entry.row);
+	const out = { mode: keywords.length ? 'metadata' : 'inventory', ...shape, total: scored.length, results };
+
+	if (!keywords.length) {
+		// Inventory answers "what is here": the children, how big they are, and
+		// the index the policy would read next.
+		const counts = new Map();
+		for (const rel of found.files) {
+			const owner = rel.slice(scope ? scope.length + 1 : 0).split('/')[0];
+			counts.set(owner, (counts.get(owner) ?? 0) + 1);
+		}
+		const folders = found.folders
+			.filter((rel) => {
+				const tail = rel.slice(scope ? scope.length + 1 : 0);
+				return tail && !tail.includes('/');
+			})
+			.map((rel) => ({ path: rel, notes: counts.get(rel.slice(scope ? scope.length + 1 : 0)) ?? 0 }));
+		if (folders.length) out.folders = folders;
+		const index = await indexForFolder(root, scope);
+		if (index) out.index = index.path;
+	}
+
+	if (results.length) {
+		out.hint = scored.length > results.length ? `${scored.length} matches in total: this is the best ${results.length}. Narrow the scope or add a keyword.` : 'Read only the notes you selected: they are atomic on purpose.';
+	} else if (keywords.length) {
+		out.hint = `No note matches all of ${shape.keywords.join(', ')} in its name or summary. Try one keyword at a time, the singular, a synonym, or the English term${excluded.length ? ` (90-Reference/ is out of the search by policy: includeReference: true reads it)` : ''}. With nothing left, the note does not exist: create it with vault_note.`;
+	}
+	return out;
+}
+
+/** The miss hint of a body search: the exclusion is the usual reason. */
+function fulltextMissHint(excluded, scope) {
+	if (excluded.length && !(scope && excluded.some((folder) => scope.startsWith(folder)))) {
+		return 'No body matches. The whole vault was read except 90-Reference/ and 99-Templates/ (policy §7): pass includeReference: true, or set scope inside 90-Reference/, when the integral documents are what you want.';
+	}
+	return 'No body matches. Try one keyword at a time, the singular, or a synonym; accents are folded, spelling is not.';
+}
+
+/**
+ * The headings of a document with their line numbers, fences skipped. Reading a
+ * long reference file starts here, not at line 1.
+ */
+function outlineOf(text, cap = 200) {
+	const out = [];
+	let fence = false;
+	String(text ?? '').split('\n').forEach((line, index) => {
+		if (line.trimStart().startsWith('```')) {
+			fence = !fence;
+			return;
+		}
+		if (fence) return;
+		const match = /^(#{1,6})\s+(.*)$/.exec(line);
+		if (match && out.length < cap) out.push({ level: match[1].length, text: match[2].trim().slice(0, 160), line: index + 1 });
+	});
+	return out;
+}
+
+/**
+ * One bounded slice of one file. The cap is the point: a 4000-line specification
+ * is entered through a search hit or the outline, and the answer says where the
+ * next chunk starts instead of pretending the file is small.
+ */
+async function readRegion(root, rel, options = {}) {
+	const full = path.join(root, rel);
+	let info;
+	try {
+		info = await stat(full);
+	} catch {
+		return { error: 'not-found', hint: 'Nothing at that path: check it with vault_search or in the Vault tab.' };
+	}
+	if (info.isDirectory()) return { error: 'is-directory', hint: 'That is a folder: ask for a file, or list it with vault_search { scope }.' };
+	if (info.size > SEARCH_FILE_BYTES * 4) return { error: 'too-large', bytes: info.size, hint: 'Read it in regions with from/lines, or search inside it with vault_search { where: "fulltext" }.' };
+	let raw;
+	try {
+		raw = await readFile(full, 'utf8');
+	} catch {
+		return { error: 'unreadable', hint: 'The file could not be read.' };
+	}
+	if (raw.includes('\u0000')) return { error: 'binary-file', hint: 'Not text: link the attachment from a note instead of reading it.' };
+	const lines = raw.split('\n');
+	const base = { path: rel, totalLines: lines.length, totalBytes: info.size };
+	if (options.outline === true) return { ...base, outline: outlineOf(raw) };
+	const from = Math.min(Math.max(1, Math.trunc(options.from ?? 1)), Math.max(1, lines.length));
+	const count = Math.min(Math.max(1, Math.trunc(options.lines ?? READ_DEFAULT_LINES)), READ_MAX_LINES);
+	const to = Math.min(lines.length, from + count - 1);
+	let text = lines.slice(from - 1, to).join('\n');
+	let cut = false;
+	if (text.length > READ_TEXT_CAP) {
+		text = text.slice(0, READ_TEXT_CAP);
+		cut = true;
+	}
+	return {
+		...base,
+		from,
+		to,
+		text,
+		hasMore: to < lines.length,
+		...(to < lines.length ? { nextFrom: to + 1 } : {}),
+		...(cut ? { cut: true } : {}),
+	};
+}
+
+/**
+ * True when some MOC links `key`: the reachability rule of policy §5, checked
+ * after a write instead of assumed. Only the indexes are read, which is what
+ * makes the check cheap enough to run on every note written.
+ */
+async function indexedBy(root, key) {
+	const found = await collectVaultFiles(root, { extensions: new Set(['.md']), cap: LINK_SCAN_CAP });
+	const indexes = found.files.filter((rel) => path.basename(rel).startsWith('00-'));
+	for (const rel of indexes) {
+		let text;
+		try {
+			text = await readFile(path.join(root, rel), 'utf8');
+		} catch {
+			continue;
+		}
+		for (const entry of proseLines(text)) {
+			LINK_PATTERN.lastIndex = 0;
+			let match;
+			while ((match = LINK_PATTERN.exec(entry.text))) {
+				if (linkPath(match[1]) === key) return { indexed: true, moc: rel };
+			}
+		}
+	}
+	return { indexed: false, mocs: indexes.length };
+}
+
+/** One atomic write of vault content: a reader never sees half a file. */
+async function atomicWrite(target, content) {
+	const temp = path.join(path.dirname(target), `.${path.basename(target)}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+	try {
+		await mkdir(path.dirname(target), { recursive: true });
+		await writeFile(temp, content, 'utf8');
+		await rename(temp, target);
+	} catch (error) {
+		await rm(temp, { force: true }).catch(() => {});
+		throw error;
+	}
+}
+
+/**
+ * §5: a section that grew past a handful of notes owns an index, and Home links
+ * indexes only. Used to question a note that was just appended to Home.
+ */
+async function folderNeedsMoc(root, folderRel) {
+	const section = String(folderRel ?? '').split('/').filter(Boolean)[0];
+	if (!section) return false;
+	const found = await collectVaultFiles(root, { scope: section, extensions: new Set(['.md']) });
+	return found.files.filter((rel) => !path.basename(rel).startsWith('00-')).length > 3;
+}
+
 /**
  * Facts about one root — the configured one or a proposed path — for the skill
  * to judge from: the tool reports, the model decides. `exact` is the verdict of
@@ -707,8 +1395,12 @@ const SKILL_DESCRIPTION = 'Create or adopt the vault folder that the Vault Tab p
 const SKILL_WHEN_TO_USE = 'Use when the vault path is missing, empty or not yet trusted, or when the user asks to set up, initialise, adopt, move or re-check a vault folder.';
 
 const NOTE_SKILL_NAME = 'vault-write';
-const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); create, replace, rename/move with link upkeep, deletion behind a link check; the Vault Grant and what to do when writing is refused.';
+const NOTE_SKILL_DESCRIPTION = 'Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); a note created and indexed in one call, files written and replaced, rename/move with link upkeep, deletion behind a link check, the policy warnings the tools answer with; the Vault Grant and what to do when writing is refused.';
 const NOTE_SKILL_WHEN_TO_USE = 'Use whenever something in the vault should change: save or jot down a note, file an idea, add or update a note, MOC line or log, rename or move a file or folder, delete a note — even when the user does not say “vault” but means their second brain.';
+
+const READ_SKILL_NAME = 'vault-read';
+const READ_SKILL_DESCRIPTION = 'Retrieve from the vault with the read tools: grep-first over file names and summaries with minimal context, inventory of a folder, full text with line numbers, 90-Reference only for deepening — and store what the vault does not have as one atomic, indexed note.';
+const READ_SKILL_WHEN_TO_USE = 'Use whenever something in the vault should be found or remembered: answer from the second brain, look up a note, check what is already known before writing it, save a fact, decision or idea, file what you just learned — even when the user does not say “vault” or “search”.';
 
 /** Model-facing contract of the write tool; short because it is read on every request. */
 const WRITE_TOOL_DESCRIPTION =
@@ -717,7 +1409,10 @@ const WRITE_TOOL_DESCRIPTION =
 	'bash tools are denied outside its workspace. The path is relative to the vault root and cannot leave it. ' +
 	'Writing needs the user’s Vault Grant, decided in the composer beside the permission selector: when the ' +
 	'tool reports the grant is off or the Session is read-only, tell the user instead of retrying, and never ' +
-	'fall back to bash or the native write. Reading the vault needs no grant and works with the usual tools.';
+	'fall back to bash or the native write. For a note prefer vault_note, which composes the frontmatter '
+	'and the MOC line; this tool writes the files a note is not. The content is checked against the vault '
+	'policy: a summary over its maximum is refused, the other rule breaks come back as warnings '
+	'(lint: "off" skips them).';
 
 function writeTool(ctx, config) {
 	return {
@@ -729,6 +1424,11 @@ function writeTool(ctx, config) {
 				path: { type: 'string', description: 'File inside the vault root, relative to it, for example 30-Resources/nota.md.' },
 				content: { type: 'string', description: 'Complete new content of the file, UTF-8 text.' },
 				overwrite: { type: 'boolean', description: 'True replaces an existing file: read it first, then pass the whole new content.' },
+				lint: {
+					type: 'string',
+					enum: ['warn', 'off'],
+					description: 'Policy check on the content: default "warn" refuses a summary over the maximum and answers with the other rule breaks; "off" writes without checking.',
+				},
 			},
 			required: ['path', 'content'],
 			additionalProperties: false,
@@ -741,6 +1441,19 @@ function writeTool(ctx, config) {
 					bytes: { type: 'integer', description: 'Bytes written.' },
 					action: { type: 'string', enum: ['created', 'replaced'], description: 'Whether the file already existed.' },
 					root: { type: 'string', description: 'Absolute vault root the path is under.' },
+					warnings: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								code: { type: 'string', description: 'Which rule, e.g. not-atomic or broken-link.' },
+								message: { type: 'string', description: 'What to fix, in one line.' },
+								examples: { type: 'array', items: { type: 'string' } },
+							},
+							additionalProperties: false,
+						},
+						description: 'Rules the content breaks: written anyway, meant to be fixed in the same change.',
+					},
 					error: { type: 'string', description: 'Refusal reason, when nothing was written.' },
 					hint: { type: 'string', description: 'What to do instead, when nothing was written.' },
 				},
@@ -751,7 +1464,7 @@ function writeTool(ctx, config) {
 					type: 'text',
 					text: value.error
 						? `vault_write refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
-						: `vault_write ${value.action} ${value.path} (${value.bytes} bytes)`,
+						: `vault_write ${value.action} ${value.path} (${value.bytes} bytes)${value.warnings?.length ? ` | ${value.warnings.length} policy warning${value.warnings.length === 1 ? '' : 's'}: ${value.warnings.map((entry) => entry.code).join(', ')}` : ''}`,
 				},
 			],
 		},
@@ -768,25 +1481,46 @@ function writeTool(ctx, config) {
 			const existing = await probe(confined.target);
 			if (existing.directory) return { error: 'is-directory', path: confined.target, hint: 'Choose a file path, not a folder.' };
 			if (existing.exists && args.overwrite !== true) return { error: 'exists', hint: 'Read the file, then send the complete new content with overwrite: true.' };
+			const rel = relPath(root, confined.target);
+			// The write budgets of the policy are checked here rather than hoped for: the vault stays
+			// searchable only while its summaries stay retrieval keys and its notes stay atomic. The
+			// maximum is the one refusal — the real vault broke it 0 times out of 308, so it catches a
+			// mistake and never a style — the rest comes back as warnings the same change fixes.
+			let warnings = [];
+			if (args.lint !== 'off') {
+				const verdict = await lintNote(root, rel, String(args.content ?? ''), await buildPathIndex(root));
+				if (verdict.hard.length) {
+					return {
+						error: 'policy-violation',
+						path: rel,
+						warnings: verdict.hard,
+						hint: `${verdict.hard[0].message} Shorten it, or repeat with lint: "off" only when the vault intends that exception.`,
+					};
+				}
+				warnings = verdict.soft;
+			}
 			// Re-check containment immediately before the syscalls: the checked
 			// path must be the written one, and an ancestor symlink may have been
 			// swapped since the first pass.
 			const fresh = await confinePath(root, args.path);
 			if (fresh.error || fresh.target !== confined.target) return { error: 'outside-root', hint: 'The path changed while writing; nothing was written.' };
-			const dir = path.dirname(fresh.target);
-			const temp = path.join(dir, `.${path.basename(fresh.target)}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
 			try {
-				await mkdir(dir, { recursive: true });
-				await writeFile(temp, String(args.content ?? ''), 'utf8');
-				await rename(temp, fresh.target);
+				await atomicWrite(fresh.target, String(args.content ?? ''));
 			} catch (error) {
-				await rm(temp, { force: true }).catch(() => {});
 				return { error: 'write-failed', hint: String((error && error.message) || error) };
 			}
+			// A note no index links is a file, not knowledge (§5). New notes only: a replace was
+			// indexed when it was born, and an index, a policy or the exempt folders are not notes.
+			if (args.lint !== 'off' && !existing.exists && rel.endsWith('.md') && !path.basename(rel).startsWith('00-') && !isPolicyFile(rel) && !inFolders(rel, [...IMMUTABLE_LINK_DIRS, ...PROTECTED_DELETE_DIRS])) {
+				if (!(await indexedBy(root, rel.slice(0, -3))).indexed) {
+					warnings = [...warnings, { code: 'not-indexed', message: 'No MOC links this note: add one line to the index that owns the folder (§5), or create it with vault_note, which does it.' }];
+				}
+			}
 			return {
-				path: path.relative(root, fresh.target).split(path.sep).join('/'),
+				path: rel,
 				bytes,
 				action: existing.exists ? 'replaced' : 'created',
+				...(warnings.length ? { warnings } : {}),
 				root,
 			};
 		},
@@ -1061,7 +1795,7 @@ function deleteTool(ctx, config) {
 					type: 'text',
 					text: value.error
 						? `vault_delete refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
-						: `vault_delete deleted ${value.path} (${value.kind}${value.entries === void 0 ? '' : `, ${value.entries} entries`}${value.forced ? ', linked notes were forced' : ''})`,
+						: `vault_delete deleted ${value.path} (${value.kind}${value.entries === void 0 ? '' : `, ${value.entries} entries`}${value.forced ? ', linked notes were forced' : ''}). ${value.hint ?? ''}`.trimEnd(),
 				},
 			],
 		},
@@ -1121,11 +1855,19 @@ function deleteTool(ctx, config) {
 			} catch (error) {
 				return failureOf(error, 'target');
 			}
+			// A forced delete leaves the lines that pointed here: say so, with the
+			// list, instead of letting the vault keep a silent broken link (policy 5).
+			const pointing = new Set([...links.referrers, ...links.immutable].map((hit) => hit.path));
 			return {
 				path: relPath(root, fresh.target),
 				kind: at.directory ? 'directory' : 'file',
 				...(entries === void 0 ? {} : { entries }),
-				...(links.hits > 0 ? { forced: true } : {}),
+				...(links.hits > 0
+					? {
+						forced: true,
+						hint: `${pointing.size} note${pointing.size === 1 ? '' : 's'} still link${pointing.size === 1 ? 's' : ''} this path (${[...pointing].slice(0, 3).join(', ')}): rewrite those lines with vault_write now, or the vault keeps a broken link.`,
+					}
+				: {}),
 				...linkFields,
 				root,
 			};
@@ -1209,6 +1951,424 @@ function infoTool(ctx, config) {
 					}
 				}
 			}
+			return out;
+		},
+	};
+}
+
+// --- Vault read tools --------------------------------------------------------
+//
+// They are registered on `tools` alone: no grant, no command, no sandbox policy.
+// A session that cannot write to the vault must still be able to search it, and
+// a profile without `sandboxPolicy` must still get its retrieval — the opposite
+// of the write capability, which needs everything.
+
+/** The folder retrieval reads: the one the Vault tab lists, whatever writes go to. */
+async function retrievalRoot(config) {
+	const root = resolveRoot(currentValue(config && config.root));
+	if (!(await probe(root)).directory) return { error: 'root-missing', root, hint: 'The vault folder is not there: ask the user, or use vault_setup.' };
+	return { root };
+}
+
+/** Model-facing contract of the search tool. */
+const SEARCH_TOOL_DESCRIPTION =
+	'Read-only grep-first search of the vault the Vault Tab plugin lists; reading needs no Vault Grant and ' +
+	'answers in every session permission. It reads only file names and the frontmatter `summary:` — the two ' +
+	'retrieval keys the vault policy defines — folding accents (citta finds città) and requiring every ' +
+	'keyword; rows are path plus summary, never bodies. No keyword means inventory of `scope`: what the ' +
+	'folder holds, its subfolders, and the MOC that indexes it. where "fulltext" searches bodies and returns ' +
+	'the matching lines with their numbers, so vault_read can start there. 90-Reference/ and 99-Templates/ ' +
+	'stay out unless includeReference or the scope is inside them.';
+
+function searchTool(ctx, config) {
+	return {
+		name: 'vault_search',
+		description: SEARCH_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				keywords: {
+					type: 'array',
+					items: { type: 'string' },
+					description: 'Words that must ALL appear in the file name or the summary. One concept per keyword; up to 8.',
+				},
+				scope: { type: 'string', description: 'Folder to search, relative to the vault root (empty: the whole vault). Narrows both modes.' },
+				where: { type: 'string', enum: ['metadata', 'fulltext'], description: 'metadata (default): names and summaries only. fulltext: bodies too, returning matching lines with numbers.' },
+				type: { type: 'string', description: 'Keep only notes whose frontmatter `type` matches (note, project, area, resource, log, moc).' },
+				includeReference: { type: 'boolean', description: 'True brings 90-Reference/ into the search, which policy §7 keeps out by default.' },
+				limit: { type: 'integer', description: 'Rows to return: default 20, maximum 60.' },
+			},
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					mode: { type: 'string', enum: ['metadata', 'inventory', 'fulltext'], description: 'What was searched.' },
+					keywords: { type: 'array', items: { type: 'string' }, description: 'The keywords, as searched (AND).' },
+					scope: { type: 'string', description: 'The folder the search covered, when it was narrowed.' },
+					root: { type: 'string', description: 'Absolute vault root the paths are under.' },
+					scanned: { type: 'integer', description: 'Files examined.' },
+					truncated: { type: 'boolean', description: 'True when the walk stopped at its cap: the vault is bigger than the answer.' },
+					total: { type: 'integer', description: 'Matches found; `results` may be shorter.' },
+					results: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								path: { type: 'string', description: 'Note path, relative to the vault root.' },
+								summary: { type: 'string', description: 'The frontmatter summary, the retrieval key.' },
+								matched: { type: 'array', items: { type: 'string' }, description: 'Which keys the keywords hit: name, summary.' },
+								status: { type: 'string', description: 'Frontmatter status, when it is not active (done, archived).' },
+								hits: { type: 'integer', description: 'Matching lines reported, full-text mode.' },
+								lines: {
+									type: 'array',
+									items: {
+										type: 'object',
+										properties: { line: { type: 'integer' }, text: { type: 'string' } },
+										additionalProperties: false,
+									},
+									description: 'The matching lines, numbered: read from one of them.',
+								},
+							},
+							additionalProperties: false,
+						},
+					},
+					folders: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { path: { type: 'string' }, notes: { type: 'integer' } },
+							additionalProperties: false,
+						},
+						description: 'Inventory mode: the subfolders of the scope and how many notes each holds.',
+					},
+					index: { type: 'string', description: 'Inventory mode: the MOC that indexes this folder, if the vault has one.' },
+					hint: { type: 'string', description: 'The next step, including what to do when nothing matched.' },
+					error: { type: 'string', description: 'Refusal reason, when nothing was searched.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => {
+				if (value.error) return [{ type: 'text', text: `vault_search refused (${value.error}): ${value.hint ?? ''}`.trimEnd() }];
+				const head = `vault_search ${value.mode}${value.keywords?.length ? ` [${value.keywords.join(', ')}]` : ''}${value.scope ? ` in ${value.scope}` : ''}: ${value.total} of ${value.scanned} files`;
+				return [{ type: 'text', text: value.results?.length ? `${head}\n${value.results.map((row) => [row.path, row.summary].filter(Boolean).join('\t')).join('\n')}` : head }];
+			},
+		},
+		isConcurrencySafe: () => true,
+		async execute(args) {
+			const gate = await retrievalRoot(config);
+			if (gate.error) return gate;
+			// The scope is a path like every other: confined to the root, never above it.
+			let scope = '';
+			if (String(args?.scope ?? '').trim()) {
+				const confined = await confinePath(gate.root, String(args.scope).trim().replace(/^\/+/, ''));
+				if (confined.error) return { error: confined.error, hint: PATH_HINT };
+				const at = await probe(confined.target);
+				if (!at.exists) return { error: 'scope-missing', hint: 'No such folder in the vault: search the whole tree with scope "".' };
+				if (!at.directory) return { error: 'scope-is-file', hint: '`scope` is a folder; one file is read with vault_read.' };
+				scope = relPath(gate.root, confined.target);
+			}
+			const result = await searchVault(gate.root, { ...(args ?? {}), scope });
+			return { root: gate.root, ...result };
+		},
+	};
+}
+
+/** Model-facing contract of the bounded reader. */
+const READ_TOOL_DESCRIPTION =
+	'Read one file inside the vault root, bounded: 120 lines by default, 400 at most, starting at any line; ' +
+	'the answer carries totalLines and nextFrom, so the next chunk is one call away. Reading needs no Vault ' +
+	'Grant. outline: true returns the headings with their line numbers instead of the text — how a long ' +
+	'document in 90-Reference/ is approached, after vault_search { where: "fulltext" } has found the term. ' +
+	'It is never a way to load a whole document.';
+
+function readTool(ctx, config) {
+	return {
+		name: 'vault_read',
+		description: READ_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				path: { type: 'string', description: 'File inside the vault root, relative to it.' },
+				from: { type: 'integer', description: '1-based line to start from (default 1).' },
+				lines: { type: 'integer', description: 'Lines to return, default 120, maximum 400.' },
+				outline: { type: 'boolean', description: 'True returns the headings and their line numbers instead of the text.' },
+			},
+			required: ['path'],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					path: { type: 'string', description: 'Read path, relative to the vault root.' },
+					totalLines: { type: 'integer', description: 'Lines in the whole file.' },
+					totalBytes: { type: 'integer', description: 'Size of the whole file.' },
+					from: { type: 'integer', description: 'First line returned.' },
+					to: { type: 'integer', description: 'Last line returned.' },
+					text: { type: 'string', description: 'The lines, joined by newlines.' },
+					hasMore: { type: 'boolean', description: 'True when the file continues past `to`.' },
+					nextFrom: { type: 'integer', description: 'Line to ask for next.' },
+					cut: { type: 'boolean', description: 'True when the answer was cut by its size, not by the line count.' },
+					outline: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { level: { type: 'integer' }, text: { type: 'string' }, line: { type: 'integer' } },
+							additionalProperties: false,
+						},
+						description: 'The headings, with the line each sits on (outline mode).' },
+					root: { type: 'string', description: 'Absolute vault root the file is under.' },
+					error: { type: 'string', description: 'Refusal reason.' },
+					hint: { type: 'string', description: 'What to do instead.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => {
+				if (value.error) return [{ type: 'text', text: `vault_read refused (${value.error}): ${value.hint ?? ''}`.trimEnd() }];
+				if (value.outline) {
+					return [{ type: 'text', text: `vault_read outline of ${value.path} (${value.totalLines} lines)\n${value.outline.map((entry) => `${'  '.repeat(entry.level - 1)}${entry.line}: ${entry.text}`).join('\n')}` }];
+				}
+				const tail = value.hasMore ? ` (from line ${value.nextFrom} to continue)` : '';
+				return [{ type: 'text', text: `${value.path}:${value.from}-${value.to} of ${value.totalLines}${tail}\n${value.text}` }];
+			},
+		},
+		isConcurrencySafe: () => true,
+		async execute(args) {
+			const gate = await retrievalRoot(config);
+			if (gate.error) return gate;
+			const confined = await confinePath(gate.root, args?.path);
+			if (confined.error) return { error: confined.error, hint: PATH_HINT };
+			const result = await readRegion(gate.root, relPath(gate.root, confined.target), args ?? {});
+			return result.error ? result : { ...result, root: gate.root };
+		},
+	};
+}
+
+/** The types a note may take, and the template each one asks for (policy §8). */
+const NOTE_TYPES = ['note', 'project', 'area', 'resource', 'log', 'moc'];
+const TEMPLATE_ASSETS = {
+	note: 'vault-template-note.md',
+	project: 'vault-template-project.md',
+	area: 'vault-template-note.md',
+	resource: 'vault-template-resource.md',
+	log: 'vault-template-log.md',
+	moc: 'vault-template-moc.md',
+};
+const TEMPLATE_FOLDER = '99-Templates';
+
+/** Model-facing contract of the storage tool. */
+const NOTE_TOOL_DESCRIPTION =
+	'Create one note in the vault and index it, in one call: the file name is built from the title ' +
+	'(kebab-case, accents folded; a log note gets the date prefix, a moc the 00- prefix), the frontmatter ' +
+	'comes from the vault’s own 99-Templates/<type>.md with the placeholders and the summary filled, and one ' +
+	'line is appended to the MOC that owns the folder (false in moc opts out). summary is required because it ' +
+	'is the retrieval key: target 100 characters, refused above 140. Keep the body to one concept (~50 lines); ' +
+	'material that cannot be atomic goes to 90-Reference/ through vault_write. Refuses to overwrite — search ' +
+	'first with vault_search and update the note that exists. Needs the user’s Vault Grant.';
+
+function noteTool(ctx, config) {
+	return {
+		name: 'vault_note',
+		description: NOTE_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				folder: { type: 'string', description: 'Folder for the note, relative to the vault root (30-Resources/citta/giappone). Missing folders are created.' },
+				title: { type: 'string', description: 'The note title: becomes the `# ` heading and, kebab-cased, the file name.' },
+				summary: { type: 'string', description: 'The retrieval key: the words someone would search for. Target 100 characters, maximum 140.' },
+				type: { type: 'string', enum: NOTE_TYPES, description: 'Which frontmatter template to use; default note.' },
+				tags: { type: 'array', items: { type: 'string' }, description: 'Tags for the frontmatter (kebab-case, no accents).' },
+				source: { type: 'string', description: 'Where the note comes from (policy §6): a URL, a "[[90-Reference/…]]" link, or a short origin.' },
+				body: { type: 'string', description: 'The body under the heading, one concept. Omit it to get the template skeleton.' },
+				name: { type: 'string', description: 'File name override, kebab-case without extension. Default: derived from the title.' },
+				moc: { type: 'boolean', description: 'False skips the index line. Default true: the owning MOC gets one, which is what makes the note reachable.' },
+			},
+			required: ['folder', 'title', 'summary'],
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					path: { type: 'string', description: 'Created note, relative to the vault root.' },
+					type: { type: 'string', description: 'The frontmatter type written.' },
+					template: { type: 'string', enum: ['vault', 'default'], description: 'Where the frontmatter came from: the vault’s template folder, or the plugin default.' },
+					summary: { type: 'string', description: 'The summary as stored.' },
+					moc: {
+						type: 'object',
+						properties: {
+							path: { type: 'string', description: 'The MOC that now lists the note.' },
+							added: { type: 'boolean', description: 'False when it already linked the note.' },
+							line: { type: 'string', description: 'The line appended, so the annotation can be edited.' },
+						},
+						additionalProperties: false,
+						description: 'The index upkeep done with the note.',
+					},
+					mocSkipped: {
+						type: 'object',
+						properties: {
+							reason: { type: 'string', description: 'Why no index line was written.' },
+							hint: { type: 'string', description: 'What to do about it.' },
+						},
+						additionalProperties: false,
+					},
+					warnings: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								code: { type: 'string', description: 'Which rule, e.g. broken-link or folder-needs-moc.' },
+								message: { type: 'string', description: 'What to fix, in one line.' },
+								examples: { type: 'array', items: { type: 'string' } },
+							},
+							additionalProperties: false,
+						},
+						description: 'Policy checks the note did not pass; the note is written anyway.',
+					},
+					root: { type: 'string', description: 'Absolute vault root the note is under.' },
+					error: { type: 'string', description: 'Refusal reason, when nothing was written.' },
+					hint: { type: 'string', description: 'What to do instead, when nothing was written.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [
+				{
+					type: 'text',
+					text: value.error
+						? `vault_note refused (${value.error}): ${value.hint ?? ''}`.trimEnd()
+						: `vault_note created ${value.path} (${value.type}, ${value.template} template)${value.moc ? ` | indexed in ${value.moc.path}${value.moc.added ? '' : ' (already there)'}` : ` | not indexed (${value.mocSkipped?.reason})`}${value.warnings?.length ? ` | ${value.warnings.length} policy warning${value.warnings.length === 1 ? '' : 's'}` : ''}`,
+				},
+			],
+		},
+		isConcurrencySafe: () => false,
+		async execute(args, exec) {
+			const gate = await mutationGate(ctx, config, exec, 'vault_note');
+			if (gate.error) return gate;
+			const root = gate.root;
+
+			const type = NOTE_TYPES.includes(args?.type) ? args.type : 'note';
+			const title = String(args?.title ?? '').trim();
+			const summary = String(args?.summary ?? '').replace(/\s+/g, ' ').trim();
+			if (!title) return { error: 'title-required', hint: 'The title names the note and becomes its file name.' };
+			if (!summary) return { error: 'summary-required', hint: 'The summary is the retrieval key: without it the note exists but is never found (policy §1).' };
+			if (textLength(summary) > SUMMARY_MAX) {
+				return { error: 'summary-too-long', hint: `The summary is ${textLength(summary)} characters; the policy stops at ${SUMMARY_MAX}. Keep the keywords, drop the sentence.` };
+			}
+
+			const folder = String(args?.folder ?? '').replace(/^\/+|\/+$/g, '').replace(/\/+/g, '/');
+			if (!folder) return { error: 'folder-required', hint: 'Choose the section and folder the note belongs to (10-Projects, 20-Areas, 30-Resources, 40-Archive).' };
+			if (/\.md$/i.test(folder)) return { error: 'folder-is-file', hint: '`folder` is a folder: the file name comes from the title.' };
+			const confinedFolder = await confinePath(root, folder);
+			if (confinedFolder.error) return { error: confinedFolder.error, hint: PATH_HINT };
+			if (inFolders(relPath(root, confinedFolder.target), [...IMMUTABLE_LINK_DIRS, ...PROTECTED_DELETE_DIRS])) {
+				return { error: 'folder-not-for-notes', hint: '90-Reference/ holds integral documents and 99-Templates/ the templates: a note goes in a PARA section, and vault_write writes those folders.' };
+			}
+
+			const slug = slugifyTitle(args?.name || title, { dated: type === 'log' });
+			const rel = `${relPath(root, confinedFolder.target)}/${type === 'moc' && !slug.startsWith('00-') ? `00-${slug}` : slug}.md`;
+			const confined = await confinePath(root, rel);
+			if (confined.error) return { error: confined.error, hint: PATH_HINT };
+			if ((await probe(confined.target)).exists) {
+				return { error: 'exists', path: rel, hint: 'A note already lives here: vault_search found it for a reason. Update it with vault_write { overwrite: true }, or choose a title that says what is different.' };
+			}
+
+			// The vault's own template wins: a vault that edited its templates edited
+			// them on purpose (§8). The shipped default is the fallback, never a
+			// replacement.
+			const vaultTemplate = path.join(root, TEMPLATE_FOLDER, `${type}.md`);
+			let text;
+			let template = 'vault';
+			try {
+				text = await readFile(vaultTemplate, 'utf8');
+			} catch {
+				text = await readAsset(TEMPLATE_ASSETS[type]).catch(() => `---\ntype: ${type}\nstatus: active\ntags: []\ncreated: {{DATE}}\nsummary: ""\n---\n\n# {{title}}\n`);
+				template = 'default';
+			}
+
+			const body = args?.body === void 0 ? '' : String(args.body);
+			if (/^\s*---\s*\n/.test(body)) return { error: 'body-has-frontmatter', hint: 'The frontmatter is composed here: send the body only, starting after it.' };
+
+			text = fillPlaceholders(text, { title, summary });
+			const fm = frontmatterOf(text);
+			text = setFrontmatterKey(text, 'type', type);
+			if (!fm.fields.status) text = setFrontmatterKey(text, 'status', 'active');
+			text = setFrontmatterKey(text, 'created', today());
+			text = setFrontmatterKey(text, 'summary', yamlValue(summary));
+			if (Array.isArray(args?.tags) && args.tags.length) {
+				text = setFrontmatterKey(text, 'tags', `[${args.tags.map((tag) => slugifyTitle(tag)).filter(Boolean).join(', ')}]`);
+			}
+			if (args?.source) text = setFrontmatterKey(text, 'source', yamlValue(args.source));
+			if (body.trim()) {
+				const head = fm.closed ? text.split('\n').slice(0, fm.end).join('\n') : text;
+				text = `${head}\n\n${noteBody(title, body)}`;
+			}
+
+			const bytes = Buffer.byteLength(text, 'utf8');
+			if (bytes > MAX_WRITE_BYTES) return { error: 'too-large', bytes, hint: `The limit is ${MAX_WRITE_BYTES} bytes.` };
+
+			const fresh = await confinePath(root, rel);
+			if (fresh.error || fresh.target !== confined.target) return { error: 'outside-root', hint: 'The path changed while writing; nothing was written.' };
+			try {
+				await atomicWrite(fresh.target, text);
+			} catch (error) {
+				return { error: 'write-failed', hint: String((error && error.message) || error) };
+			}
+
+			const key = rel.slice(0, -3);
+			const out = { path: rel, type, template, summary, root };
+
+			// The index line is the second half of "a note exists": without it the
+			// vault has a file, not knowledge. Failures here are reported, never
+			// hidden, and never undo the note that is already written.
+			if (args?.moc === false) {
+				out.mocSkipped = { reason: 'declined', hint: 'The policy still wants one line in a MOC: add it when the note has its final title.' };
+			} else {
+				const target = await indexForFolder(root, path.dirname(rel));
+				if (!target) {
+					out.mocSkipped = { reason: 'no-index', hint: 'Neither the folder nor any ancestor holds a 00-*.md, and there is no 00-Home.md at the root: create the index, then link the note.' };
+				} else {
+					const mocFile = await confinePath(root, target.path);
+					let current = '';
+					try {
+						current = await readFile(mocFile.target, 'utf8');
+					} catch {
+						current = '';
+					}
+					const already = proseLines(current).some((entry) => {
+						LINK_PATTERN.lastIndex = 0;
+						let match;
+						while ((match = LINK_PATTERN.exec(entry.text))) if (linkPath(match[1]) === key) return true;
+						return false;
+					});
+					if (already) {
+						out.moc = { path: target.path, added: false };
+					} else {
+						const line = mocEntryLine(key, summary);
+						try {
+							await atomicWrite(mocFile.target, appendMocLine(current, line));
+							out.moc = { path: target.path, added: true, line };
+						} catch (error) {
+							out.mocSkipped = { reason: 'index-unwritable', hint: `The note is written but not indexed (${String((error && error.message) || error)}): add the line \`${line}\` to ${target.path} yourself.` };
+						}
+					}
+				}
+			}
+
+			const index = await buildPathIndex(root);
+			const { soft } = await lintNote(root, rel, text, index);
+			const folderRel = path.dirname(rel);
+			const section = folderRel.split('/')[0];
+			if (!/^(10|20|30|40)-/.test(section)) {
+				soft.push({ code: 'folder-outside-para', message: `${section}/ is not a PARA section: notes live under 10-Projects, 20-Areas, 30-Resources or 40-Archive.` });
+			}
+			if (out.mocSkipped) {
+				soft.push({ code: 'not-indexed', message: `No MOC lists this note yet (§5): ${out.mocSkipped.reason}.` });
+			} else if (out.moc && path.dirname(out.moc.path) === '.' && (await folderNeedsMoc(root, folderRel))) {
+				soft.push({ code: 'folder-needs-moc', message: `The note landed on Home, but ${folderRel.split('/')[0]}/ already holds several notes: policy §5 gives a grown section its own 00-<section>.md and keeps Home linking indexes only.` });
+			}
+			if (soft.length) out.warnings = soft;
 			return out;
 		},
 	};
@@ -1309,41 +2469,67 @@ export function apply(ctx, config) {
 
 	// The write capability needs the mode, a tool slot and a human command; a
 	// profile without any of them still gets the tab and the read-only listing.
+	// Retrieval binds here too: the tool slot the agents actually inherit is the
+	// one alongside commands and the sandbox policy — an injector asking for
+	// `tools` alone never fires. Placement is not a gate: `vault_search` and
+	// `vault_read` never consult the Grant, so they work in every session mode.
 	ctx.inject(['tools', 'commands', 'sandboxPolicy'], (scope) => {
 		scope.effect(() => scope.tools.register(writeTool(scope, config)), 'dsh-vault-tab: write tool');
+		scope.effect(() => scope.tools.register(noteTool(scope, config)), 'dsh-vault-tab: note tool');
 		scope.effect(() => scope.tools.register(moveTool(scope, config)), 'dsh-vault-tab: move tool');
 		scope.effect(() => scope.tools.register(deleteTool(scope, config)), 'dsh-vault-tab: delete tool');
 		scope.effect(() => scope.tools.register(infoTool(scope, config)), 'dsh-vault-tab: info tool');
+		scope.effect(() => scope.tools.register(searchTool(scope, config)), 'dsh-vault-tab: search tool');
+		scope.effect(() => scope.tools.register(readTool(scope, config)), 'dsh-vault-tab: read tool');
 		scope.effect(() => scope.commands.register(writeCommand(scope, config)), 'dsh-vault-tab: write command');
 	});
 
+	// Two skills, one per direction: the vault is read with the search tools and
+	// changed with the `vault_*` mutations. Both are always registered — unlike the
+	// setup skill they describe behaviour the tools cannot enforce on their own.
 	ctx.inject(['skills'], (scope) => {
-		const file = path.join(HERE, 'skills', 'vault-write.md');
-		let text;
-		try {
-			text = readFileSync(file, 'utf8');
-		} catch (error) {
-			scope.logger.warn('dsh-vault-tab: %s unreadable, note skill not registered (%s)', file, String((error && error.message) || error));
-			return;
-		}
-		const body = text.replace(/^﻿/, '').replace(/^---[^]*?---\s*/, '').trim();
-		scope.effect(
-			() =>
-				scope.skills.register({
-					name: NOTE_SKILL_NAME,
-					description: NOTE_SKILL_DESCRIPTION,
-					whenToUse: NOTE_SKILL_WHEN_TO_USE,
-					content: body,
-					// `source` is required even though `register()` does not check it:
-					// the loader validates the whole definition, so a registration
-					// without it shows up in the catalog and then fails the moment
-					// anyone actually loads the skill.
-					source: 'runtime',
-					provider: '@local/dsh-vault-tab',
-				}),
-			'dsh-vault-tab: note skill',
-		);
+		registerTextSkill(scope, {
+			file: 'vault-write.md',
+			name: NOTE_SKILL_NAME,
+			description: NOTE_SKILL_DESCRIPTION,
+			whenToUse: NOTE_SKILL_WHEN_TO_USE,
+			label: 'dsh-vault-tab: note skill',
+		});
+		registerTextSkill(scope, {
+			file: 'vault-read.md',
+			name: READ_SKILL_NAME,
+			description: READ_SKILL_DESCRIPTION,
+			whenToUse: READ_SKILL_WHEN_TO_USE,
+			label: 'dsh-vault-tab: read skill',
+		});
 	});
+
+/** Register one skill shipped as a Markdown file, frontmatter stripped. */
+function registerTextSkill(ctx, options) {
+	let text;
+	try {
+		text = readFileSync(path.join(HERE, 'skills', options.file), 'utf8');
+	} catch (error) {
+		ctx.logger.warn('%s unreadable, skill not registered (%s)', options.file, String((error && error.message) || error));
+		return;
+	}
+	const body = text.replace(/^\uFEFF/, '').replace(/^---[^]*?---\s*/, '').trim();
+	ctx.effect(
+		() =>
+			ctx.skills.register({
+				name: options.name,
+				description: options.description,
+				whenToUse: options.whenToUse,
+				content: body,
+				// `source` is required even though `register()` does not check it: the
+				// loader validates the whole definition, so a registration without it shows
+				// up in the catalog and then fails the moment anyone loads the skill.
+				source: 'runtime',
+				provider: '@local/dsh-vault-tab',
+			}),
+		options.label,
+	);
+}
 
 	// --- Vault setup capability --------------------------------------------------
 	// The skill is guidance only, so it costs context in every session: the

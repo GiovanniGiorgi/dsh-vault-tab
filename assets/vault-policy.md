@@ -31,6 +31,10 @@ for. Target **100** characters; **max 140** only for dense notes (reference,
 hardening, audit, porting). Descriptive richness belongs in the MOC annotations,
 not in the summary.
 
+These are budgets, not style advice: a new note over 140 is refused, a rewrite
+over 100 comes back as a warning, and so does a note that outgrew ~50 lines. The
+tool checks them so that this file stays the only place the numbers are written.
+
 ## 2. Naming
 
 Logic: numeric prefixes order folders by reading frequency, `00-` keeps indexes
@@ -38,7 +42,10 @@ first.
 
 - Content folders: `kebab-case`, like files (`trips`, `cities`, `ai-implementation`); the numbered roots (`20-Areas/` etc.) stay unchanged
 - Numeric prefixes: **10** projects, **20** areas, **30** resources, **40** archive, **90** reference, **99** templates
-- Files: `kebab-case.md`, no accents (`second-brain-para.md`)
+- Files: `kebab-case.md`, no accents (`second-brain-para.md`); the seeded
+  `00-Home.md` is the one canonical name with a capital
+- No emoji in names, keys or summaries: retrieval is textual, decoration stays
+  out of the vault
 - MOC indexes: `00-<section>.md` inside the folder they index
 - Dated notes: `YYYY-MM-DD-topic.md`
 - One note = one concept, ~50 lines maximum. When it grows, split and link.
@@ -46,11 +53,13 @@ first.
 ## 3. Retrieval (grep-first, minimal context)
 
 1. **Never read the whole vault** or whole folders.
-2. Grep metadata first, **excluding `90-Reference/`** (see §7):
+2. Search **metadata** first: file names and summaries, **excluding
+   `90-Reference/`** (see §7), accents folded so "citta" finds "città". With the
+   vault tools that is `vault_search { keywords }`; by hand:
    - file names: `find . -type f -name '*.md' -not -path './90-Reference/*' | grep -i keyword`
    - summaries: `grep -ri '^summary:' --include='*.md' . --exclude-dir=90-Reference | grep -i keyword`
-   - search without accents ("citta" finds "città"): strip accents from the keyword
-3. Read **only** the files you selected, and only when the answer needs them.
+3. Read **only** the files you selected, and only when the answer needs them
+   (`vault_read`, a region at a time).
 4. No match after retrying synonyms, singulars, one keyword at a time → the note
    does not exist: create it from a template in `99-Templates/`, then link it.
 5. Update `status` and `summary` after every substantial change.
@@ -97,7 +106,7 @@ Quote wiki links and never write a bare path in `source:`: Obsidian follows
 `[[…]]` and renders `90-Reference/foo.md` as inert text.
 
 **Inline in the prose — what a sentence points at.** A labelled Markdown link,
-kept short, next to the entity it documents: `📍[mappa](https://www.google.com/maps/place/…)`,
+kept short, next to the entity it documents: `[mappa](https://www.google.com/maps/place/…)`,
 `[docs](https://…)`, `[repo](https://…)`. Vault notes reached from the text use
 `[[path|alias]]` with the path from the vault root.
 
@@ -116,8 +125,9 @@ manuals, exported documents — the material notes are distilled from.
 - Use it for **deepening**, after a note or a MOC points there: from the note's
   `source:`, from the section index `[[90-Reference/00-Reference]]`, or from a
   link inside the note.
-- Read it in pieces, never whole: `grep -n` for the term, then read the region
-  around the hit.
+- Read it in pieces, never whole: `vault_search { keywords, where: "fulltext",
+  includeReference: true }` for the numbered lines, then `vault_read` with that
+  `from` — or `{ outline: true }` to see the headings first. By hand: `grep -n`.
 - Treat the files as immutable: do not edit or reformat them; corrections go into
   the distilled note. An imported document stays as it was imported, including its
   own relative `[label](file.md)` links — Obsidian resolves those, and rewriting

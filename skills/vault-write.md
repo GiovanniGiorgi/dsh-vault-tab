@@ -1,6 +1,6 @@
 ---
 name: vault-write
-description: Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); one link form; create, replace, rename/move with automatic link upkeep, deletion behind a link check; the Vault Grant and what to do when writing is refused.
+description: Write into the vault with the vault tools: rules first (root POLICY.md, then the target folder’s POLICY.md); one link form; a note created and indexed in one call, files written and replaced, rename/move with automatic link upkeep, deletion behind a link check; the policy warnings the tools answer with; the Vault Grant and what to do when writing is refused.
 ---
 
 # Writing into the vault
@@ -37,18 +37,40 @@ notes move or die; anything else silently rots.
 - Links that leave the vault — `https://…`, `mailto:` — are not
   vault links: nobody rewrites them, leave them exactly as they are.
 
-## 3. Creating and replacing
+## 3. Creating
 
-`vault_write { path, content, overwrite? }` — `path` relative to the vault root
-(`30-Resources/citta/parigi.md`), `content` the **complete** file (UTF-8, ≤ 1 MiB).
-Missing folders are created. To replace an existing file: `read` it first, then send
-its whole new content with `overwrite: true`; without it the tool answers `exists`
-and nothing is written.
+**Search first** (`vault_search`, no grant needed): a duplicate note is the one
+answer that gets worse with time, and the tool that updates an existing file is not
+the one that invents a second copy of it.
 
-Writing a note is usually two writes: the note itself and the index line the policy
-requires (its MOC). Finish the job the policy started, same rules, same order.
+A **note** is created with `vault_note { folder, title, summary, type?, tags?, source?, body? }`,
+which does the two writes the policy asks for in one call: the file — name built
+`kebab-case` and accent-free from the title, frontmatter filled from the vault's own
+`99-Templates/<type>.md` — and the **one line in the MOC** that owns the folder
+(`moc: false` opts out, and then you owe that line). It refuses to overwrite, and it
+refuses a `summary` over the maximum: the summary *is* the retrieval key, so an empty
+or bloated one is not a style problem.
 
-## 4. Renaming and moving
+Anything that is **not a note** goes through `vault_write { path, content, overwrite? }`
+— `path` relative to the vault root (`90-Reference/progetto/doc.md`, an index, an
+imported file), `content` the **complete** file (UTF-8, ≤ 1 MiB). Missing folders are
+created. To replace an existing file: `read` it first, then send its whole new content
+with `overwrite: true`; without it the tool answers `exists` and nothing is written.
+
+## 4. The warnings are the vault's budgets
+
+Both writers check the content against the policy and answer with `warnings`
+(`not-atomic`, `broken-link`, `link-not-canonical`, `not-indexed`,
+`summary-over-target`, `emoji-in-key`, `path-not-kebab`, `folder-needs-moc`). They are
+not decoration: each one is a rule the vault learned the hard way, and the fix belongs
+to the same change, not to a later clean-up. The one **refusal** is a `summary` past its
+maximum (`policy-violation`): shorten it; `lint: 'off'` exists for an exception the
+vault genuinely intends, and asking for it is a decision to tell the user about.
+
+A note is one concept (~50 lines) and `90-Reference/` is where material that cannot be
+atomic lives — imported whole, cited from the distilled note's `source:`, never grepped.
+
+## 5. Renaming and moving
 
 `vault_move { from, to, overwrite?, links?, dryRun? }` — both paths relative to the
 vault root; a folder moves with everything under it. Folders never merge or replace
@@ -69,7 +91,7 @@ part is deciding when to stop, not how to search:
 - The meaning: a renamed project, a MOC line that must be added where the old one
   was dropped, a note whose body says something false once it moves.
 
-## 5. Deleting
+## 6. Deleting
 
 `vault_delete { path, recursive?, confirm?, force? }` — no trash: the removal is
 immediate and final. The link check runs **inside** the tool, before anything goes:
@@ -88,7 +110,7 @@ immediate and final. The link check runs **inside** the tool, before anything go
   `recursive: true`, and the answer reports how many entries went with it.
 - The vault root itself can never be deleted.
 
-## 6. The Vault Grant
+## 7. The Vault Grant
 
 Changing the vault needs the user's **Vault** control, in the composer beside the
 permission selector: Read Only never writes; Workspace Write writes only while the
