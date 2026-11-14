@@ -277,9 +277,9 @@ const LINK_PATTERN = /\[\[([^[\]|#]+)((?:#[^[\]|]*))?(\|[^[\]]*)?\]\]/g;
 /** The same link, non-global: to re-extract groups from an ORIGINAL line after matching on a masked one. */
 const LINK_ONCE = new RegExp(LINK_PATTERN.source);
 
-/** Vault links carry no extension; a stray `.md` is tolerated when reading. */
+/** Vault links carry no extension; a stray `.md` is tolerated when reading. Compared in NFC, the form the tools keep. */
 function linkPath(raw) {
-	return String(raw).trim().replace(/\.md$/, '');
+	return String(raw).trim().normalize('NFC').replace(/\.md$/, '');
 }
 
 /**
@@ -498,7 +498,10 @@ async function applyLinkRewrite(root, target, newTarget, folder) {
  * then is the missing suffix re-joined. Returns `{ target }` or `{ error }`.
  */
 async function confinePath(root, rel) {
-	const clean = String(rel ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
+	// The vault's one form for special characters: NFC (composed). It is taught by
+	// the skill and enforced at the boundary, so names, links and indexes all
+	// speak the same bytes; file *content* is never normalized.
+	const clean = String(rel ?? '').normalize('NFC').replace(/\\/g, '/').replace(/^\/+/, '');
 	if (!clean || clean.split('/').some((part) => part === '' || part === '.' || part === '..')) return { error: 'invalid-path' };
 	const lexical = path.resolve(root, clean);
 	if (lexical !== root && !lexical.startsWith(root + path.sep)) return { error: 'outside-root' };
@@ -581,7 +584,7 @@ const EMOJI_PATTERN = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{
 
 /** `kebab-case.md`; a dated note may carry the `YYYY-MM-DD-` prefix (policy §2). The seeded
  * home index is the one canonical name with a capital, so it is allowed by name. */
-const KEBAB_NAME = /^([a-z0-9][a-z0-9._-]*|00-Home)\.md$/;
+const KEBAB_NAME = /^([a-z0-9\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}][a-z0-9._\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}-]*|00-Home)\.md$/u;
 
 /** A policy file is vault machinery, not a note: the root one and any section policy. */
 function isPolicyFile(rel) {
@@ -825,12 +828,12 @@ async function lintNote(root, rel, text, index) {
 		soft.push({ code: 'not-atomic', message: `${bodyLines} lines of body: one concept is ~${NOTE_LINE_TARGET}. Split it and link the parts, or keep the long material in 90-Reference/ (§2).` });
 	}
 
-	if (!KEBAB_NAME.test(base)) soft.push({ code: 'path-not-kebab', message: `\`${base}\` is not kebab-case ASCII without accents (§2).` });
+	if (!KEBAB_NAME.test(base)) soft.push({ code: 'path-not-kebab', message: `\`${base}\` is not kebab-case (CJK letters are welcome too) (§2).` });
 	const odd = rel
 		.split('/')
 		.slice(0, -1)
-		.filter((folder, depth) => !(depth === 0 && /^\d\d-[A-Z]/.test(folder)) && !/^[a-z0-9][a-z0-9._-]*$/.test(folder));
-	if (odd.length) soft.push({ code: 'path-not-kebab', message: `Folder names that are not kebab-case: ${odd.join(', ')} (§2).` });
+		.filter((folder, depth) => !(depth === 0 && /^\d\d-[A-Z]/.test(folder)) && !/^[a-z0-9\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}][a-z0-9._\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}-]*$/u.test(folder));
+	if (odd.length) soft.push({ code: 'path-not-kebab', message: `Folder names that are not kebab-case (CJK letters are welcome too): ${odd.join(', ')} (§2).` });
 
 	if (isMoc) {
 		const prose = proseLines(text)
@@ -858,9 +861,14 @@ async function lintNote(root, rel, text, index) {
  * creatable even from a title made of punctuation.
  */
 function slugifyTitle(title, options = {}) {
-	const slug = foldText(String(title ?? ''))
+	// The slug keeps the chosen title faithful: Latin folds to kebab, and Han,
+	// hiragana and katakana stay their own characters (ー and 々 are Script=Common,
+	// so they are named). The second NFC pass re-composes what the fold splits:
+	// kana dakuten come back whole instead of falling out as separators. Every
+	// other script folds away, as it always did.
+	const slug = foldText(String(title ?? '').normalize('NFC')).normalize('NFC')
 		.replace(/&/g, ' and ')
-		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/[^a-z0-9\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}ー々]+/gu, '-')
 		.replace(/-+/g, '-')
 		.replace(/^-|-$/g, '')
 		.slice(0, 60)

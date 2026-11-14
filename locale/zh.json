@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Vault Tab",
+    "description": "在右侧边栏添加 Vault 标签页：以原生预览显示已配置文件夹的文件树。同时为会话提供 vault 工具：vault_search 与 vault_read 用于 grep 优先检索（按文件名和摘要，排除 reference），vault_note、vault_write、vault_move、vault_delete 用于写入；写入按会话通过 composer 中的 Vault Grant 授权，并根据 vault 的 POLICY.md 检查。可选的 vault-setup 技能可创建或采用该文件夹；vault 建成后即可关闭。"
+  }
+}

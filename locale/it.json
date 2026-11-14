@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Vault Tab",
+    "description": "Aggiunge una scheda Vault alla barra laterale destra: l'albero di una cartella configurata, con anteprime native. Fornisce alla sessione anche i tool del vault: vault_search e vault_read per il recupero grep-first (nomi e riassunti, reference esclusa), vault_note, vault_write, vault_move e vault_delete per la scrittura, abilitata per sessione dal Vault Grant nel composer e verificata contro il POLICY.md del vault. Una skill opzionale vault-setup crea o adotta la cartella: spegnila quando il vault esiste."
+  }
+}

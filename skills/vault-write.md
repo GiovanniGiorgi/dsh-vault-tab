@@ -56,6 +56,9 @@ Anything that is **not a note** goes through `vault_write { path, content, overw
 imported file), `content` the **complete** file (UTF-8, ≤ 1 MiB). Missing folders are
 created. To replace an existing file: `read` it first, then send its whole new content
 with `overwrite: true`; without it the tool answers `exists` and nothing is written.
+Write `path` and `title` in NFC — special characters composed (`ガ`, `é` as one
+character): the tools normalize and compare in that form, so reusing a name from a
+`vault_search` or `vault_read` answer beats retyping it.
 
 ## 4. The warnings are the vault's budgets
 

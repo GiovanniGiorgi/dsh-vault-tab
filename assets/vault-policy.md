@@ -40,9 +40,11 @@ tool checks them so that this file stays the only place the numbers are written.
 Logic: numeric prefixes order folders by reading frequency, `00-` keeps indexes
 first.
 
-- Content folders: `kebab-case`, like files (`trips`, `cities`, `ai-implementation`); the numbered roots (`20-Areas/` etc.) stay unchanged
+- Content folders: `kebab-case`, like files, CJK letters welcome (`trips`, `cities`, `ai-implementation`); the numbered roots (`20-Areas/` etc.) stay unchanged
 - Numeric prefixes: **10** projects, **20** areas, **30** resources, **40** archive, **90** reference, **99** templates
-- Files: `kebab-case.md`, no accents (`second-brain-para.md`); the seeded
+- Files: the name follows the title. Latin folds to `kebab-case.md`
+  (`Second Brain PARA` → `second-brain-para.md`); kanji, hiragana and katakana keep
+  their own characters (`東京-ノート.md`) — no transliteration. The seeded
   `00-Home.md` is the one canonical name with a capital
 - No emoji in names, keys or summaries: retrieval is textual, decoration stays
   out of the vault

@@ -455,6 +455,51 @@ if (RH) {
 	results.push({ name: `INFO costo su ${REAL} (${real.scanned} note): metadata ${(t1 - t0).toFixed(0)}ms, fulltext ${(t3 - t2).toFixed(0)}ms (${realFull.scanned} file, ${realFull.total} match)`, pass: real.scanned > 150 && real.total > 5, detail: '' });
 }
 
+// --- CJK e forme Unicode -------------------------------------------------------
+await check('note: kanji e kana restano nel nome file', async () => {
+	const n = await note({ folder: '30-Resources/citta', title: '東京 ノート 🚀', summary: 'Nota CJK per la fedeltà del nome scelto.', body: 'Contenuto kanji.' });
+	return n.path === '30-Resources/citta/東京-ノート.md' ? true : `path=${n.path} err=${n.error ?? ''}`;
+});
+await check('note: ー e 々 non cadono', async () => {
+	const n = await note({ folder: '30-Resources/citta', title: 'コーヒー ブレーク', summary: 'Titolo con allungamento per il test slug.' });
+	return n.path === '30-Resources/citta/コーヒー-ブレーク.md' ? true : `path=${n.path} err=${n.error ?? ''}`;
+});
+await check('search: keyword CJK trova il file per nome', async () => {
+	const fresh = harness();
+	const r = await fresh.tools.vault_search.execute({ keywords: ['東京'] }, fresh.exec);
+	return r.results.some((row) => row.path === '30-Resources/citta/東京-ノート.md') ? true : `total=${r.total}`;
+});
+await check('confine: argomento NFD raggiunge il file scritto NFC', async () => {
+	const r = await read({ path: '30-Resources/citta/東京-ノート.md'.normalize('NFD') });
+	return (r.text ?? '').includes('Contenuto kanji') ? true : `err=${r.error}`;
+});
+await check('move: da argomento NFD, nome che esce NFC', async () => {
+	const m = await tools.vault_move.execute({ from: '30-Resources/citta/東京-ノート.md'.normalize('NFD'), to: '30-Resources/citta/東京-メモ.md' }, H.exec);
+	const onDisk = await stat(path.join(ROOT, '30-Resources/citta/東京-メモ.md')).then(() => true, () => false);
+	return m.action === 'renamed' && onDisk ? true : `m=${JSON.stringify({ a: m.action, e: m.error })}`;
+});
+await check('upkeep: link NFD riconosce il file NFC e viene riscritto NFC', async () => {
+	await write({ path: '30-Resources/citta/linkatore.md', lint: 'off', content: '---\ntype: note\nsummary: "Linkatore per upkeep cross-forma."\n---\n\nvedi ' + '[[30-Resources/citta/コーヒー-ブレーク]]'.normalize('NFD') + '.\n' });
+	const m = await tools.vault_move.execute({ from: '30-Resources/citta/コーヒー-ブレーク.md', to: '30-Resources/citta/コーヒー-riposo.md' }, H.exec);
+	const body = await readFile(path.join(ROOT, '30-Resources/citta/linkatore.md'), 'utf8');
+	const rewrote = (m.changed ?? []).some((c) => c.path === '30-Resources/citta/linkatore.md');
+	return rewrote && body.includes('[[30-Resources/citta/コーヒー-riposo]]') ? true : JSON.stringify({ changed: m.changed, e: m.error });
+});
+await check('altre lingue invariate: cirillico ricade su nota', async () => {
+	const n = await note({ folder: '30-Resources/citta', title: 'Отчёт', summary: 'Titolo cirillico: comportamento documentato.' });
+	return (n.path ?? '').endsWith('/nota.md') ? true : `path=${n.path} err=${n.error}`;
+});
+await check('lint: nome CJK non fa path-not-kebab', async () => {
+	const r = await write({ path: '30-Resources/citta/kyoto-京都.md', content: '---\ntype: note\nsummary: "Nome misto latino e kanji."\n---\n\nx\n' });
+	const kebab = (r.warnings ?? []).filter((x) => x.code === 'path-not-kebab');
+	return !r.error && kebab.length === 0 ? true : JSON.stringify({ e: r.error, w: kebab });
+});
+await check('delete: argomento NFD cancella il file NFC', async () => {
+	const r = await tools.vault_delete.execute({ path: '30-Resources/citta/東京-メモ.md'.normalize('NFD'), force: true }, H.exec);
+	const gone = await stat(path.join(ROOT, '30-Resources/citta/東京-メモ.md')).then(() => false, () => true);
+	return !r.error && gone ? true : `err=${r.error}`;
+});
+
 // --- esito -------------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 for (const r of results) console.log(`${r.pass ? 'ok  ' : 'FAIL'} ${r.name}${r.detail ? `\n       → ${r.detail.split('\n').slice(0, 4).join('\n       ')}` : ''}`);
