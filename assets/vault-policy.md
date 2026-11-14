@@ -3,14 +3,20 @@ type: policy
 status: active
 tags: [policy]
 created: {{DATE}}
-summary: "AI rules: frontmatter schema, naming, grep-first retrieval, MOC links-only, citations, reference, templates, git"
+summary: "This vault's rules: PARA structure, schema budgets, naming, MOC links-only, source citations, reference, templates, section policies, git"
 ---
 
-# Vault policy (AI)
+# Vault policy
 
-Rules for any AI working in this vault. The vault is a folder of small Markdown
-notes organised with PARA. Read this file before creating or editing a note.
-Section-specific rules live in the section, not here (see §9).
+The rules of **this** vault: structure, schema, budgets, conventions. The
+`vault_*` tools enforce what can be enforced (a crossed rule comes back as a
+warning or a refusal); the skills `vault-read`, `vault-write` and `vault-setup`
+teach how to work with them. The numbers below are the single place they are
+written: change one without changing the tools and the vault splits in two.
+
+Structure: six numbered folders (`10-Projects`, `20-Areas`, `30-Resources`,
+`40-Archive`, `90-Reference`, `99-Templates`), the `00-Home.md` index and this
+file at the root. Folder-specific rules live inside the folder (§9), never here.
 
 ## 1. Frontmatter schema (required on every note)
 
@@ -26,45 +32,37 @@ source: # optional provenance: URL(s), a [[90-Reference/…]] link, or a short f
 ---
 ```
 
-`summary` is the retrieval key: it must contain the words someone would search
-for. Target **100** characters; **max 140** only for dense notes (reference,
-hardening, audit, porting). Descriptive richness belongs in the MOC annotations,
-not in the summary.
-
-These are budgets, not style advice: a new note over 140 is refused, a rewrite
-over 100 comes back as a warning, and so does a note that outgrew ~50 lines. The
-tool checks them so that this file stays the only place the numbers are written.
+`summary` is the retrieval key — `vault_search` reads it and nothing of the
+body: it must hold the words someone would search for. Target **100**
+characters, **140** for dense notes only; past it a write is refused, past 100
+it comes back as a warning. Richness belongs in the MOC annotation (§5). After
+a substantial change update `status` and `summary`: a stale key hides the note.
 
 ## 2. Naming
 
-Logic: numeric prefixes order folders by reading frequency, `00-` keeps indexes
-first.
+Numeric prefixes order folders by reading frequency; `00-` keeps indexes first.
 
-- Content folders: `kebab-case`, like files, CJK letters welcome (`trips`, `cities`, `ai-implementation`); the numbered roots (`20-Areas/` etc.) stay unchanged
-- Numeric prefixes: **10** projects, **20** areas, **30** resources, **40** archive, **90** reference, **99** templates
-- Files: the name follows the title. Latin folds to `kebab-case.md`
-  (`Second Brain PARA` → `second-brain-para.md`); kanji, hiragana and katakana keep
-  their own characters (`東京-ノート.md`) — no transliteration. The seeded
-  `00-Home.md` is the one canonical name with a capital
-- No emoji in names, keys or summaries: retrieval is textual, decoration stays
-  out of the vault
+- Content folders: `kebab-case`, like files, CJK letters welcome
+  (`trips`, `ai-implementation`); the numbered roots keep their names
+- Files: the name follows the title — Latin folds to `kebab-case.md`
+  (`Second Brain PARA` → `second-brain-para.md`), kanji and kana keep their own
+  characters; `00-Home.md` is the one canonical name with a capital
 - MOC indexes: `00-<section>.md` inside the folder they index
 - Dated notes: `YYYY-MM-DD-topic.md`
-- One note = one concept, ~50 lines maximum. When it grows, split and link.
+- No emoji in names, keys or summaries: retrieval is textual
+- One note = one concept, **~50 lines**: past that, split and link — material
+  that cannot be atomic is not a note and goes to `90-Reference/` (§7)
 
 ## 3. Retrieval (grep-first, minimal context)
 
-1. **Never read the whole vault** or whole folders.
-2. Search **metadata** first: file names and summaries, **excluding
-   `90-Reference/`** (see §7), accents folded so "citta" finds "città". With the
-   vault tools that is `vault_search { keywords }`; by hand:
-   - file names: `find . -type f -name '*.md' -not -path './90-Reference/*' | grep -i keyword`
-   - summaries: `grep -ri '^summary:' --include='*.md' . --exclude-dir=90-Reference | grep -i keyword`
-3. Read **only** the files you selected, and only when the answer needs them
-   (`vault_read`, a region at a time).
-4. No match after retrying synonyms, singulars, one keyword at a time → the note
-   does not exist: create it from a template in `99-Templates/`, then link it.
-5. Update `status` and `summary` after every substantial change.
+What a search of this vault may look at:
+
+- **File names and the `summary:` frontmatter only**; bodies are read after a
+  note is picked, a region at a time. Accents and case are folded (`citta`
+  finds `città`), spelling is not
+- Markdown notes only, **excluding `90-Reference/` (§7) and `99-Templates/` (§8)**
+- No match after synonyms, singulars, one keyword at a time → the note does not
+  exist: say so, then store what answers (§4)
 
 ## 4. Saving
 
@@ -72,89 +70,73 @@ first.
 - Durable knowledge → `30-Resources/`
 - Long-lived responsibilities and collections → `20-Areas/`
 - Dead material → `40-Archive/`, keeping its internal structure
-- Every new note gets: complete frontmatter + one backlink in a MOC
+- Every new note: complete frontmatter (§1) + **one line in the MOC that owns
+  the folder** (§5) — `vault_note` writes both
 
 ## 5. MOC files: links only
 
-A MOC (`00-Home.md` and every `00-<section>.md`) is an **index, not a note**.
+A MOC (`00-Home.md`, every `00-<section>.md`) is an index, not a note.
 
-- Content is only list items: a wiki link plus a short one-line annotation. No
-  prose, no sections of argument, no images, no code.
-- A MOC carries **no `source:`** field: it is not derived from anything, it points.
-  The one exception is a source that covers the **whole folder** the MOC indexes
-  (its reference corpus, or the document the section was built from): that
-  `source:` belongs to the MOC instead of to the individual notes.
-- Home links only section MOCs (at most one level at a time), never the single
-  notes of a section. A section with more than ~3 notes gets its own
-  `00-<section>.md`; the Home entry points at that MOC.
-- Adding a note means adding one line to the owning MOC. Deleting or renaming a
-  note means fixing that line.
+- List items only: a wiki link plus a short annotation. No prose, no images, no code
+- **No `source:`** — the one exception is a source covering the whole folder
+  the MOC indexes (its reference corpus)
+- Home links section MOCs only, never single notes; a section past **~3 notes**
+  gets its own `00-<section>.md` and the Home entry points at that
+- Every note is reachable from an index: add the line when a note arrives, fix
+  it when one moves or dies. A note no MOC links is a file, not knowledge
 
-## 6. Where a link goes
+## 6. Links and source
 
-Two different jobs, two different places.
+**One internal link form:** `[[path/from/the/vault/root]]` — no `.md`, no
+alias, no anchor, no short name; embeds repeat it with `!`. It is the shape the
+tools keep correct across moves. Links leaving the vault (`https://…`) are
+plain Markdown: nothing rewrites them. No link may resolve to nothing — create
+the target in the same change, or drop it.
 
-**`source:` in the frontmatter — where the note comes from.** One value or a
-list, when several documents feed one note. Allowed values:
+**`source:` — where the note comes from.** One value or a list; allowed:
 
-1. an **internet URL** of the document the note was distilled from:
-   `https://source.android.com/docs/core/graphics/hwc`
-2. a **vault link to a `90-Reference/` document**, quoted:
+1. the **internet URL** of the document it was distilled from
+2. a **quoted** link to a `90-Reference/` document:
    `"[[90-Reference/<project>/<document>]]"`
-3. a short **free-text origin** when no document exists:
-   `"Discussione di revisione specifiche (2026-11)"`
+3. a short **free-text origin** when no document exists
 
-Quote wiki links and never write a bare path in `source:`: Obsidian follows
-`[[…]]` and renders `90-Reference/foo.md` as inert text.
-
-**Inline in the prose — what a sentence points at.** A labelled Markdown link,
-kept short, next to the entity it documents: `[mappa](https://www.google.com/maps/place/…)`,
-`[docs](https://…)`, `[repo](https://…)`. Vault notes reached from the text use
-`[[path|alias]]` with the path from the vault root.
-
-Never a path to a folder outside the vault — anything worth citing is copied into
-`90-Reference/` or linked by URL — and no link that resolves to nothing: create
-the target in the same change, or drop the link.
+Quote wiki links, never bare paths: Obsidian renders an unquoted
+`90-Reference/foo.md` in `source:` as inert text. External material mentioned
+inline keeps a short labelled Markdown link next to the entity (`[docs](https://…)`).
 
 ## 7. `90-Reference/`: integral sources, out of search
 
-`90-Reference/` holds **non-atomic** resources: papers, specifications, logs,
-manuals, exported documents — the material notes are distilled from.
+Papers, specifications, logs, manuals, exported documents: the material notes
+are distilled from.
 
-- Exempt from the note schema (§1) and from atomicity: one file may be long.
-- **Excluded from grep-first retrieval** (§3): searching the vault skips this
-  folder. Reference answers come from the atomic notes.
-- Use it for **deepening**, after a note or a MOC points there: from the note's
-  `source:`, from the section index `[[90-Reference/00-Reference]]`, or from a
-  link inside the note.
-- Read it in pieces, never whole: `vault_search { keywords, where: "fulltext",
-  includeReference: true }` for the numbered lines, then `vault_read` with that
-  `from` — or `{ outline: true }` to see the headings first. By hand: `grep -n`.
-- Treat the files as immutable: do not edit or reformat them; corrections go into
-  the distilled note. An imported document stays as it was imported, including its
-  own relative `[label](file.md)` links — Obsidian resolves those, and rewriting
-  them would corrupt the source. New material goes in a per-project subfolder
-  (`90-Reference/<project>/`) with its own `00-<project>.md` index, listed in
-  `90-Reference/00-Reference.md`.
+- Exempt from the schema (§1) and from atomicity: a file may be long
+- Out of search (§3): reached only by **deepening** — a note's `source:`, the
+  index `[[90-Reference/00-Reference]]`, a link — and read in pieces, never whole
+- **Immutable**: no edits, no reformatting, no link upkeep inside; corrections
+  go into the distilled note. An imported document keeps its own relative links
+  as imported
+- New material: a per-project subfolder with its own `00-<project>.md` index,
+  listed in `90-Reference/00-Reference.md`
 
 ## 8. `99-Templates/`
 
-Templates keep their own format, with placeholders like `{{date:YYYY-MM-DD}}` and
-`{{title}}`, and are exempt from the note schema. They are the starting point for
-new files: `note.md`, `project.md`, `resource.md`, `log.md`, `moc.md`. When you create a file
-from one, replace the placeholders with today's date and the note's title, and
-write `summary` last. Do not write new notes freehand and do not turn a template
-into a note.
+The types (§1) are the templates: `99-Templates/<type>.md` — `note`, `project`,
+`resource`, `log`, `moc` (`area` reuses `note.md`). Placeholders
+(`{{date:YYYY-MM-DD}}`, `{{title}}`) keep the Obsidian syntax; templates are
+exempt from the schema and out of search (§3). A new file starts from its
+template — `vault_note` fills it — and `summary` is written last, when the note
+is what it is.
 
 ## 9. Section policy
 
-Rules specific to one section (structure, naming, note shape) live in a
-`POLICY.md` **inside that section's folder**, not in this file. Before working in
-a section, read its `POLICY.md` if one exists. The general policy never lists
-single-section rules: it would go stale and load irrelevant context.
+Rules specific to one folder — its structure, its naming, the shape of its
+notes — live in a `POLICY.md` **inside that folder** and govern its whole
+subtree: inside the folder they override this file, which applies everywhere
+else. A `POLICY.md` is vault machinery, not a note: exempt from the schema (§1),
+never linted, never rewritten as a link.
 
 ## 10. Git: commit only on explicit request
 
-- Work normally ends in the working tree: writing the files is enough, no `git add` / `git commit`.
-- Commit **only if the user explicitly asks** in the request. A request to change something does not imply a commit.
-- Never `push`, `reset`, `amend` or `rebase` to repair your own work: report it and wait.
+- Work ends in the working tree: writing the files is enough, no `git add` / `git commit`
+- Commit **only if the user explicitly asks**; a request to change something does not imply a commit
+- Never `push`, `reset`, `amend` or `rebase` to repair your own work: report it and wait
