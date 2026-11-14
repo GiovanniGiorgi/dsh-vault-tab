@@ -706,7 +706,9 @@ async function mocOfFolder(dir) {
  * `00-tokyo.md` instead of landing on Home.
  */
 async function indexForFolder(root, folderRel) {
-	const segments = String(folderRel ?? '').split('/').filter(Boolean);
+	// `.` survives `dirname` chains at the root ("./x" → "."): it names the root
+	// itself, and a literal segment would poison the returned path (`./00-Home.md`).
+	const segments = String(folderRel ?? '').split('/').filter((part) => part && part !== '.');
 	for (;;) {
 		const dir = segments.length ? path.join(root, ...segments) : root;
 		const name = await mocOfFolder(dir);
@@ -2385,27 +2387,31 @@ function noteTool(ctx, config) {
 					out.mocSkipped = { reason: 'no-index', hint: 'Neither the folder nor any ancestor holds a 00-*.md, and there is no 00-Home.md at the root: create the index, then link the note.' };
 				} else {
 					const mocFile = await confinePath(root, target.path);
-					let current = '';
-					try {
-						current = await readFile(mocFile.target, 'utf8');
-					} catch {
-						current = '';
-					}
-					const already = proseLines(current).some((entry) => {
-						LINK_PATTERN.lastIndex = 0;
-						let match;
-						while ((match = LINK_PATTERN.exec(entry.text))) if (linkPath(match[1]) === key) return true;
-						return false;
-					});
-					if (already) {
-						out.moc = { path: target.path, added: false };
+					if (mocFile.error) {
+						out.mocSkipped = { reason: 'index-unwritable', hint: `The index ${target.path} does not resolve inside the vault (${mocFile.error}): add the line for [[${key}]] by hand.` };
 					} else {
-						const line = mocEntryLine(key, summary);
+						let current = '';
 						try {
-							await atomicWrite(mocFile.target, appendMocLine(current, line));
-							out.moc = { path: target.path, added: true, line };
-						} catch (error) {
-							out.mocSkipped = { reason: 'index-unwritable', hint: `The note is written but not indexed (${String((error && error.message) || error)}): add the line \`${line}\` to ${target.path} yourself.` };
+							current = await readFile(mocFile.target, 'utf8');
+						} catch {
+							current = '';
+						}
+						const already = proseLines(current).some((entry) => {
+							LINK_PATTERN.lastIndex = 0;
+							let match;
+							while ((match = LINK_PATTERN.exec(entry.text))) if (linkPath(match[1]) === key) return true;
+							return false;
+						});
+						if (already) {
+							out.moc = { path: target.path, added: false };
+						} else {
+							const line = mocEntryLine(key, summary);
+							try {
+								await atomicWrite(mocFile.target, appendMocLine(current, line));
+								out.moc = { path: target.path, added: true, line };
+							} catch (error) {
+								out.mocSkipped = { reason: 'index-unwritable', hint: `The note is written but not indexed (${String((error && error.message) || error)}): add the line \`${line}\` to ${target.path} yourself.` };
+							}
 						}
 					}
 				}
