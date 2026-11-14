@@ -83,7 +83,7 @@ window.__ModuleLoader__.load({
     /** Patch row id whose volatile config this card edits. */
     const CONFIG_ROW_ID = 'vault-tab';
 
-    /** Staged text spec for the single root field: absolute path or clear. */
+    /** Staged text spec for the single root field: absolute path, ~ prefix, or clear. */
     const rootSpec = {
       field: 'root',
       format: function (value) {
@@ -92,7 +92,9 @@ window.__ModuleLoader__.load({
       parse: function (text) {
         const trimmed = text.trim();
         if (!trimmed) return { kind: 'clear' };
-        if (trimmed.charAt(0) !== '/') return void 0;
+        // The Host expands '~' for both roots; the card must not reject what the
+        // profile patch would accept.
+        if (trimmed !== '~' && !trimmed.startsWith('~/') && trimmed.charAt(0) !== '/') return void 0;
         return { kind: 'set', value: trimmed };
       },
     };

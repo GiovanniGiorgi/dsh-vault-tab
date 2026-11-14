@@ -23,8 +23,9 @@
 //    anything is written or removed.
 //
 // 3. Vault read: `vault_search` and `vault_read`, with the `vault-read` skill.
-//    Reading is not a permission, so this capability asks for nothing but a tool
-//    slot and never consults the Grant. It exists because the retrieval the
+//    Reading is not a permission: the two tools share the binding scope of the
+//    writing ones — that is where the tool slot the agents inherit lives — but
+//    they never consult the Grant. They exist because the retrieval the
 //    vault policy describes is a discipline a raw `grep` does not enforce: grep
 //    the metadata (names and `summary:`) before the content, return the smallest
 //    answer that decides the next step, keep `90-Reference/` out of the search
@@ -273,6 +274,9 @@ function failureOf(error, what) {
  */
 const LINK_PATTERN = /\[\[([^[\]|#]+)((?:#[^[\]|]*))?(\|[^[\]]*)?\]\]/g;
 
+/** The same link, non-global: to re-extract groups from an ORIGINAL line after matching on a masked one. */
+const LINK_ONCE = new RegExp(LINK_PATTERN.source);
+
 /** Vault links carry no extension; a stray `.md` is tolerated when reading. */
 function linkPath(raw) {
 	return String(raw).trim().replace(/\.md$/, '');
@@ -301,6 +305,11 @@ function proseLines(text) {
 		if (!fence) lines.push({ text: line, line: index + 1 });
 	});
 	return lines;
+}
+
+/** Blank out inline code spans, so `[[nodiscard]]` written as code is not read as a link. */
+function maskInlineCode(line) {
+	return line.replace(/`[^`\n]*`/g, (span) => ' '.repeat(span.length));
 }
 
 /** Folders whose files the vault declares read-only: hits there are reported, never rewritten. */
@@ -374,9 +383,11 @@ async function scanLinks(root, target, folder, skip) {
 			continue;
 		}
 		for (const entry of proseLines(text)) {
+			// The prose rule of the lint, here too: a link inside inline code is an example, not a link.
+			const line = maskInlineCode(entry.text);
 			LINK_PATTERN.lastIndex = 0;
 			let match;
-			while ((match = LINK_PATTERN.exec(entry.text))) {
+			while ((match = LINK_PATTERN.exec(line))) {
 				if (!refersTo(linkPath(match[1]), target, folder)) continue;
 				hits += 1;
 				(inFolders(rel, IMMUTABLE_LINK_DIRS) ? immutable : referrers).push(linkHit(rel, entry.line, entry.text));
@@ -427,13 +438,27 @@ async function applyLinkRewrite(root, target, newTarget, folder) {
 			const next = clean === target ? newTarget : newTarget + clean.slice(target.length);
 			return `[[${next}${anchor}${alias}]]`;
 		};
-		// The same prose rule as the scan: a link inside a code fence is an
-		// example, and an upkeep that edited examples would corrupt the very
-		// documents that teach the convention.
+		// The same prose rule as the scan: a link inside a code fence — or inside
+		// inline code — is an example, and an upkeep that edited examples would
+		// corrupt the very documents that teach the convention. Matching happens on
+		// the masked line, splicing on the original one: an alias carrying backticks
+		// keeps its bytes.
 		const lines = text.split('\n');
 		for (const entry of proseLines(text)) {
-			const nextLine = entry.text.replace(LINK_PATTERN, rewrite);
-			if (nextLine !== entry.text) lines[entry.line - 1] = nextLine;
+			const masked = maskInlineCode(entry.text);
+			let nextLine = '';
+			let cursor = 0;
+			let match;
+			LINK_PATTERN.lastIndex = 0;
+			while ((match = LINK_PATTERN.exec(masked))) {
+				const groups = entry.text.slice(match.index, match.index + match[0].length).match(LINK_ONCE);
+				if (!groups) continue;
+				const replaced = rewrite(groups[0], groups[1], groups[2] ?? '', groups[3] ?? '');
+				if (replaced === groups[0]) continue;
+				nextLine += entry.text.slice(cursor, match.index) + replaced;
+				cursor = match.index + match[0].length;
+			}
+			if (cursor) lines[entry.line - 1] = nextLine + entry.text.slice(cursor);
 		}
 		const rewritten = lines.join('\n');
 		if (hits === 0) continue;
@@ -590,11 +615,6 @@ function frontmatterOf(text) {
 	return { present: true, closed: end > 0, fields, end };
 }
 
-/** The `summary` of a note, or `''`. It is the retrieval key, so every read path wants it. */
-function summaryOf(text) {
-	return frontmatterOf(text).fields.summary ?? '';
-}
-
 /** The keywords of one call, split, deduplicated, folded once for every comparison. */
 function normalizeKeywords(input) {
 	const list = Array.isArray(input) ? input : [input];
@@ -712,11 +732,6 @@ async function buildPathIndex(root) {
 	return { keys, folders: new Set(found.folders), unique, scanned: keys.size, truncated: found.truncated };
 }
 
-/** Blank out inline code spans, so `[[nodiscard]]` written as code is not read as a link. */
-function maskInlineCode(line) {
-	return line.replace(/`[^`\n]*`/g, (span) => ' '.repeat(span.length));
-}
-
 /**
  * Where the links of one note point. `broken` is nothing the vault holds;
  * `notCanonical` is a short name Obsidian resolves today by unique-basename
@@ -746,7 +761,18 @@ async function linkFindings(root, rel, text, index) {
 				continue;
 			}
 			// An attachment (`.png`, `.pdf`) is a file and not a note: ask the disk.
-			if (/\.[a-z0-9]{2,5}$/.test(base) && (await probe(path.join(root, target))).exists) continue;
+			if (/\.[a-z0-9]{2,5}$/.test(base)) {
+				// `probe` rejects paths that cannot even be built (a stray control
+				// character) and folders the OS shields: a broken-looking link is a
+				// warning, never a reason to abort the pass.
+				let there = false;
+				try {
+					there = (await probe(path.join(root, target))).exists;
+				} catch {
+					there = false;
+				}
+				if (there) continue;
+			}
 			broken.add(target);
 		}
 	}
@@ -954,10 +980,13 @@ async function searchVault(root, options = {}) {
 			}
 			const hay = foldText(text);
 			if (!keywords.every((keyword) => hay.includes(keyword))) continue;
+			const fm = frontmatterOf(text);
+			// `type` narrows both modes: a body search for notes skips templates and logs.
+			if (wanted && foldText(fm.fields.type ?? '') !== wanted) continue;
 			// The frontmatter is what the metadata search already answers: prefer the
 			// lines of the body, and fall back to the first hit when the term only
 			// lives in the summary.
-			const start = frontmatterOf(text).end;
+			const start = fm.end;
 			const lines = [];
 			const body = text.split('\n');
 			for (let i = start; i < body.length && lines.length < 3; i++) {
@@ -971,14 +1000,16 @@ async function searchVault(root, options = {}) {
 			scored.push({ score: lines.length, row: { path: rel, hits: lines.length, lines } });
 		}
 		scored.sort((a, b) => b.score - a.score || a.row.path.localeCompare(b.row.path));
-		const results = scored.map((entry) => entry.row);
+		const results = scored.slice(0, limit).map((entry) => entry.row);
 		return {
 			mode: 'fulltext',
 			...shape,
-			total: results.length,
+			total: scored.length,
 			results,
 			hint: results.length
-				? 'Read only the region you need: vault_read { path, from: <line> } starts where a hit is.'
+				? scored.length > results.length
+					? `${scored.length} matches in total: this is the best ${results.length}. Narrow the scope or add a keyword.`
+					: 'Read only the region you need: vault_read { path, from: <line> } starts where a hit is.'
 				: fulltextMissHint(excluded, scope),
 		};
 	}
@@ -1049,7 +1080,7 @@ async function searchVault(root, options = {}) {
 
 /** The miss hint of a body search: the exclusion is the usual reason. */
 function fulltextMissHint(excluded, scope) {
-	if (excluded.length && !(scope && excluded.some((folder) => scope.startsWith(folder)))) {
+	if (excluded.length && !(scope && excluded.some((folder) => scope === folder || scope.startsWith(folder + '/')))) {
 		return 'No body matches. The whole vault was read except 90-Reference/ and 99-Templates/ (policy §7): pass includeReference: true, or set scope inside 90-Reference/, when the integral documents are what you want.';
 	}
 	return 'No body matches. Try one keyword at a time, the singular, or a synonym; accents are folded, spelling is not.';
@@ -1488,7 +1519,13 @@ function writeTool(ctx, config) {
 			// mistake and never a style — the rest comes back as warnings the same change fixes.
 			let warnings = [];
 			if (args.lint !== 'off') {
-				const verdict = await lintNote(root, rel, String(args.content ?? ''), await buildPathIndex(root));
+				// The lint never aborts a write: a pathological vault answers with a warning, not an exception.
+				let verdict;
+				try {
+					verdict = await lintNote(root, rel, String(args.content ?? ''), await buildPathIndex(root));
+				} catch (error) {
+					verdict = { hard: [], soft: [{ code: 'lint-unavailable', message: `Policy lint could not run (${String((error && error.message) || error)}): check the note against POLICY.md by hand.` }] };
+				}
 				if (verdict.hard.length) {
 					return {
 						error: 'policy-violation',
@@ -1717,8 +1754,21 @@ function moveTool(ctx, config) {
 			}
 			try {
 				await mkdir(path.dirname(freshTo.target), { recursive: true });
-				if (there.exists) await rm(freshTo.target, { force: true });
-				await rename(freshFrom.target, freshTo.target);
+				if (there.exists) {
+					// The replaced file steps aside first: if the rename fails it goes back,
+					// and a failed move never destroys the file it was replacing.
+					const aside = freshTo.target + '.dsh-replaced-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
+					await rename(freshTo.target, aside);
+					try {
+						await rename(freshFrom.target, freshTo.target);
+					} catch (error) {
+						await rename(aside, freshTo.target).catch(() => {});
+						throw error;
+					}
+					await rm(aside, { force: true }).catch(() => {});
+				} else {
+					await rename(freshFrom.target, freshTo.target);
+				}
 			} catch (error) {
 				return failureOf(error, there.exists ? 'target' : 'source');
 			}
@@ -2325,7 +2375,12 @@ function noteTool(ctx, config) {
 			if (args?.moc === false) {
 				out.mocSkipped = { reason: 'declined', hint: 'The policy still wants one line in a MOC: add it when the note has its final title.' };
 			} else {
-				const target = await indexForFolder(root, path.dirname(rel));
+				let target = await indexForFolder(root, path.dirname(rel));
+				// A MOC does not index itself: the index that owns it is the one that
+				// owns the folder it sits in, so when the walk finds the file just
+				// written the search restarts from the parent folder.
+				if (type === 'moc' && target && target.path === rel) target = await indexForFolder(root, path.dirname(path.dirname(rel)));
+				if (target && target.path === rel) target = null;
 				if (!target) {
 					out.mocSkipped = { reason: 'no-index', hint: 'Neither the folder nor any ancestor holds a 00-*.md, and there is no 00-Home.md at the root: create the index, then link the note.' };
 				} else {
@@ -2357,7 +2412,14 @@ function noteTool(ctx, config) {
 			}
 
 			const index = await buildPathIndex(root);
-			const { soft } = await lintNote(root, rel, text, index);
+			let soft = [];
+			// Same rule as `vault_write`: the note is already on disk, a lint that
+			// cannot run must not report the whole call as failed.
+			try {
+				soft = (await lintNote(root, rel, text, index)).soft;
+			} catch {
+				soft = [{ code: 'lint-unavailable', message: 'Policy lint could not run: check the note against POLICY.md by hand.' }];
+			}
 			const folderRel = path.dirname(rel);
 			const section = folderRel.split('/')[0];
 			if (!/^(10|20|30|40)-/.test(section)) {
@@ -2415,8 +2477,11 @@ export function apply(ctx, config) {
 		if (site && site !== 'same-origin') return json(res, 403, { error: 'foreign-origin' });
 		const url = new URL(req.url, 'http://dsh.invalid');
 		const rel = (url.searchParams.get('path') ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
-		const target = path.resolve(root, rel);
-		if (target !== root && !target.startsWith(root + path.sep)) return json(res, 403, { error: 'outside-root' });
+		// Containment like the tools': lexical check plus realpath of the deepest
+		// existing ancestor, so a symlinked folder cannot leak a listing from outside.
+		const confined = rel ? await confinePath(root, rel) : { target: path.resolve(root) };
+		if (confined.error) return json(res, 403, { error: 'outside-root' });
+		const target = confined.target;
 		let dirents;
 		try {
 			dirents = await readdir(target, { withFileTypes: true });

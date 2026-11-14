@@ -57,7 +57,8 @@ expand to the home of the user running DSH), and save. The change applies
 immediately; press Reload in the tab to re-read the tree.
 
 **Write root** is for the rare case where the tree you browse and the tree you
-change are different folders; leave it empty to use the same root for both.
+change are different folders; the card does not carry the field yet — set
+`writeRoot` in the profile patch, and omit it to use the same root for both.
 
 Saving writes a profile override; **Reset** removes it and restores the
 default. The package itself contains no configuration.
@@ -91,7 +92,8 @@ instead of failing silently.
 | `vault_info` | facts about the vault: root, write root, policy present, grant state |
 | `vault_setup` | creates or adopts the folder this tab lists (see below) |
 
-`/vault-write` in the composer starts the writing flow in one keystroke.
+`/vault-write` in the composer shows or flips this session's Vault Grant
+(`on | off | status`).
 
 **Warnings are the vault's budgets.** A write returns the checks it failed
 (`summary-over-target`, `not-atomic`, `not-indexed`, `broken-link`,

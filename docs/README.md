@@ -16,9 +16,9 @@ Reading and writing the vault are different jobs with different risks, so they g
 different teaching and different gates:
 
 - **`vault-read`** covers a session that is allowed nothing but to look. Its two
-  tools are registered in a scope that asks for `tools` alone — no sandbox policy —
-  because `vault_read` never consults the sandbox: it works in Read only, and even
-  in a profile without that service. The skills themselves live in the plain
+  tools bind with the writing ones — the tool slot the agents actually inherit
+  lives in that scope — yet they never consult the Grant: `vault_read` answers in
+  Read only as well. The skills themselves live in the plain
   `skills` scope and are always registered.
 - **`vault-write`** covers mutations, and starts from the one thing the tools
   cannot decide: whether the *user* has opened the Vault Grant for this session.

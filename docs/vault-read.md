@@ -6,9 +6,8 @@ never a permission
 ## What it is for
 
 Answering from the vault with the smallest context that decides the next step, and
-storing what the vault did not have. Registered in a scope that asks only for tool
-slots: a session that cannot write, and a profile without the sandbox policy, still
-search and read.
+storing what the vault did not have. The tools bind with the writing ones but
+never consult the Grant: a session that cannot write still searches and reads.
 
 It fires whenever something should be found or remembered, *even when the user does
 not say "vault" or "search"*.
