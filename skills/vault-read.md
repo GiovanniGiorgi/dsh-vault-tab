@@ -57,7 +57,7 @@ Search first — a duplicate note is the one answer that gets worse with time. T
   `90-Reference/`, an index, an imported file. Both answer with **policy warnings**
   (`not-atomic`, `broken-link`, `summary-over-target`, `not-indexed` …): they are
   the vault's budgets, and the same change should finish them.
-- One note = one concept, ~50 lines. A note that grows is split and linked, not
+- One note = one concept, ~80 lines. A note that grows is split and linked, not
   extended. Material that cannot be atomic is not a note: it goes to
   `90-Reference/`, and the distilled note cites it in `source:`.
 - Where it goes (§4 of the policy): facts and decisions → `10-Projects/`, durable

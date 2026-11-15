@@ -560,8 +560,8 @@ const SEARCH_TEXT_EXTS = new Set(['.md', '.txt', '.log', '.json', '.csv', '.yaml
 const SUMMARY_TARGET = 100;
 const SUMMARY_MAX = 140;
 
-/** One concept per note, ~50 lines (policy §2). Measured on the real vault: 23 of 308 above it. */
-const NOTE_LINE_TARGET = 50;
+/** One concept per note, ~80 lines (policy §2). Tuned on a real 308-note vault where 23 passed 50. */
+const NOTE_LINE_TARGET = 80;
 
 /** Code points in a string, so an emoji counts as one and a budget means what it says. */
 function textLength(value) {
@@ -2224,7 +2224,7 @@ const NOTE_TOOL_DESCRIPTION =
 	'(kebab-case, accents folded; a log note gets the date prefix, a moc the 00- prefix), the frontmatter ' +
 	'comes from the vault’s own 99-Templates/<type>.md with the placeholders and the summary filled, and one ' +
 	'line is appended to the MOC that owns the folder (false in moc opts out). summary is required because it ' +
-	'is the retrieval key: target 100 characters, refused above 140. Keep the body to one concept (~50 lines); ' +
+	'is the retrieval key: target 100 characters, refused above 140. Keep the body to one concept (~80 lines); ' +
 	'material that cannot be atomic goes to 90-Reference/ through vault_write. Refuses to overwrite — search ' +
 	'first with vault_search and update the note that exists. Needs the user’s Vault Grant.';
 

@@ -6,8 +6,8 @@ or a vault: each suite builds its own fixture and throws it away.
 | suite | checks | what it covers |
 | --- | --- | --- |
 | `vault-tools.test.mjs` | 56 | the eight tools, driven as a session drives them: registration, `vault_search` (metadata / inventory / full text), `vault_read`, `vault_note`, `vault_write` and its lint, `vault_delete`, the Vault Grant in all three modes, and every output validated against the schema the tool declares |
-| `link-engine.test.mjs` | 14 | the link scan/rewrite engine behind `vault_move` and `vault_delete`: folder prefixes, referrers inside frontmatter, embeds, external referrers reported separately |
-| `link-canonical.test.mjs` | 13 | the canonical link form only: root-relative, no alias, case-sensitive — and everything that must never be touched (fenced examples, relative links, URLs, case variants) |
+| `link-engine.test.mjs` | 14 | the link scan/rewrite engine behind `vault_move` and `vault_delete`: folder prefixes, **alias and anchors preserved**, referrers inside frontmatter, embeds, external referrers reported separately |
+| `link-canonical.test.mjs` | 13 | the canonical link form only: root-relative and case-sensitive — and everything that must never be touched (fenced examples, relative links, URLs, case variants) |
 
 ## How they get at the real code
 

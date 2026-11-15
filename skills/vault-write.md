@@ -26,7 +26,7 @@ memory, and never let the user be the one who remembers the policy.
 ## 2. The link form: one shape, always
 
 Internal links are `[[path/from/the/vault/root]]` and nothing else: from the root,
-**no** `.md`, **no** `|alias`, **no** `#anchor`, **no** short names, **no**
+**no** `.md`, **no** `#anchor`, **no** short names, **no**
 `[text](relative.md)`. Embeds use the same path with `!`:
 `![[30-Resources/img/mappa.png]]`. This is the one form the tools keep correct when
 notes move or die; anything else silently rots.
@@ -70,7 +70,7 @@ to the same change, not to a later clean-up. The one **refusal** is a `summary` 
 maximum (`policy-violation`): shorten it; `lint: 'off'` exists for an exception the
 vault genuinely intends, and asking for it is a decision to tell the user about.
 
-A note is one concept (~50 lines) and `90-Reference/` is where material that cannot be
+A note is one concept (~80 lines) and `90-Reference/` is where material that cannot be
 atomic lives — imported whole, cited from the distilled note's `source:`, never grepped.
 
 ## 5. Renaming and moving

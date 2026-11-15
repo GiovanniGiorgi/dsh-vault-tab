@@ -345,7 +345,7 @@ await check('write: lint off scrive lo stesso', async () => {
 	return r.action === 'created' && r.warnings === void 0 ? true : JSON.stringify(r).slice(0, 160);
 });
 await check('write: not-atomic, not-indexed, emoji e nome non kebab', async () => {
-	const body = Array.from({ length: 70 }, (_x, i) => `riga ${i}`).join('\n');
+	const body = Array.from({ length: 110 }, (_x, i) => `riga ${i}`).join('\n');
 	const r = await write({ path: '30-Resources/test-Nota Confusa.md', content: `---\ntype: note\nstatus: active\ntags: []\ncreated: 2026-11-14\nsummary: "Nota lunga con emoji 👍 nel summary per il test del lint"\n---\n\n# Confusa\n\n${body}\n` });
 	const codes = (r.warnings ?? []).map((x) => x.code);
 	return codes.includes('not-atomic') && codes.includes('not-indexed') && codes.includes('emoji-in-key') && codes.includes('path-not-kebab') ? true : codes.join(',');

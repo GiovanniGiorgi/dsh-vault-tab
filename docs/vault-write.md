@@ -47,7 +47,7 @@ that would fire on existing material is a bug, not a standard:
 | --- | --- | --- |
 | `summary` ≤ 140 | 0 files | **refused** (`policy-violation`): past that the index stops being searchable |
 | `summary` ≤ 100 target | 74 files | warning `summary-over-target` |
-| one concept, ~50 lines | 23 files | warning `not-atomic` |
+| one concept, ~80 lines | 23 files | warning `not-atomic` |
 | no emoji in names/keys | 1 | warning `emoji-in-key` |
 | every link resolves | 7 broken (6 inside reference, e.g. `[[nodiscard]]`) | warning `broken-link` — fenced code and inline code are skipped |
 | every note in a MOC | 199/201 | warning `not-indexed`, plus `folder-needs-moc` when a section outgrew ~3 notes |

@@ -50,7 +50,7 @@ Numeric prefixes order folders by reading frequency; `00-` keeps indexes first.
 - MOC indexes: `00-<section>.md` inside the folder they index
 - Dated notes: `YYYY-MM-DD-topic.md`
 - No emoji in names, keys or summaries: retrieval is textual
-- One note = one concept, **~50 lines**: past that, split and link — material
+- One note = one concept, **~80 lines**: past that, split and link — material
   that cannot be atomic is not a note and goes to `90-Reference/` (§7)
 
 ## 3. Retrieval (grep-first, minimal context)
@@ -87,8 +87,7 @@ A MOC (`00-Home.md`, every `00-<section>.md`) is an index, not a note.
 
 ## 6. Links and source
 
-**One internal link form:** `[[path/from/the/vault/root]]` — no `.md`, no
-alias, no anchor, no short name; embeds repeat it with `!`. It is the shape the
+**One internal link form:** `[[path/from/the/vault/root]]` — no `.md`, no anchor, no short name; embeds repeat it with `!`. It is the shape the
 tools keep correct across moves. Links leaving the vault (`https://…`) are
 plain Markdown: nothing rewrites them. No link may resolve to nothing — create
 the target in the same change, or drop it.
