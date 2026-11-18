@@ -119,14 +119,14 @@ const shape = async (toolName, args, value) => {
 };
 
 // --- registrazione -----------------------------------------------------------
-await check('registrati setup, write, note, move, delete, info, search, read', () => {
-	const missing = ['vault_setup', 'vault_write', 'vault_note', 'vault_move', 'vault_delete', 'vault_info', 'vault_search', 'vault_read'].filter((name) => !tools[name]);
+await check('registrati setup, write, note, move, delete, info, git, search, read', () => {
+	const missing = ['vault_setup', 'vault_write', 'vault_note', 'vault_move', 'vault_delete', 'vault_info', 'vault_git', 'vault_search', 'vault_read'].filter((name) => !tools[name]);
 	return missing.length ? `mancano: ${missing}` : true;
 });
 await check('comando /vault-write registrato', () => (H.commands.some((c) => c.name === 'vault-write') ? true : 'nessun comando'));
-await check('skill vault-setup, vault-write, vault-read registrate', () => {
+await check('skill vault-setup, vault-write, vault-read, vault-git registrate', () => {
 	const names = H.skills.map((s) => s.name).sort();
-	return JSON.stringify(names) === JSON.stringify(['vault-read', 'vault-setup', 'vault-write']) ? true : names.join(',');
+	return JSON.stringify(names) === JSON.stringify(['vault-git', 'vault-read', 'vault-setup', 'vault-write']) ? true : names.join(',');
 });
 await check('skill: contenuto senza frontmatter e con whenToUse', () => {
 	const bad = H.skills.filter((s) => s.content.startsWith('---') || !s.whenToUse || !s.description || s.content.length < 400);

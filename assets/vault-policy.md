@@ -138,4 +138,5 @@ never linted, never rewritten as a link.
 
 - Work ends in the working tree: writing the files is enough, no `git add` / `git commit`
 - Commit **only if the user explicitly asks**; a request to change something does not imply a commit
+- When the user asks, commit through `vault_git`: audit first — links must resolve, budgets must pass — then split unrelated topics into separate commits, each with a brief indicative message in the language of the vault
 - Never `push`, `reset`, `amend` or `rebase` to repair your own work: report it and wait

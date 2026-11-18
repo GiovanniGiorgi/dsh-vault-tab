@@ -1,6 +1,6 @@
 // Host half of @local/dsh-vault-tab.
 //
-// Three capabilities live here, and they are deliberately not equally gated:
+// Four capabilities live here, and they are deliberately not equally gated:
 //
 // 1. The Vault tab listing: one exact JSON route listing one level of the
 //    configured root. An unset root falls back to `<home>/Vault`, so a fresh
@@ -30,8 +30,17 @@
 //    the metadata (names and `summary:`) before the content, return the smallest
 //    answer that decides the next step, keep `90-Reference/` out of the search
 //    and enter long documents in regions.
+//
+// 4. Vault git: `vault_git`, with the `vault-git` skill. The vault's policy (§10)
+//    commits only on an explicit request and repairs nothing by rewriting
+//    history, so the tool offers one fixed vocabulary — status, audit, commit —
+//    run through argv: push/reset/amend/rebase are not reachable at all. Commit
+//    adds its own locks on top of the Grant: a clean integrity audit whose token
+//    dies with the next edit, and the user's agreement carried as `confirm: true`.
 import { readFileSync } from 'node:fs';
 import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -106,6 +115,11 @@ export const Config = z.object({
 		.boolean()
 		.default(false)
 		.description('Start a session under Workspace Write with the Vault Grant on. Read Only never writes, Full access always does.')
+		.volatile(),
+	gitCommit: z
+		.boolean()
+		.default(true)
+		.description('Let vault_git commit the vault repository — after its integrity audit and the user’s confirmation. Status and audit stay available with this off; nothing else in this plugin ever runs git.')
 		.volatile(),
 });
 
@@ -1443,6 +1457,10 @@ const READ_SKILL_NAME = 'vault-read';
 const READ_SKILL_DESCRIPTION = 'Retrieve from the vault with the read tools: grep-first over file names and summaries with minimal context, inventory of a folder, full text with line numbers, 90-Reference only for deepening — and store what the vault does not have as one atomic, indexed note.';
 const READ_SKILL_WHEN_TO_USE = 'Use whenever something in the vault should be found or remembered: answer from the second brain, look up a note, check what is already known before writing it, save a fact, decision or idea, file what you just learned — even when the user does not say “vault” or “search”.';
 
+const GIT_SKILL_NAME = 'vault-git';
+const GIT_SKILL_DESCRIPTION = 'Commit the vault git working tree with the vault_git tool: an integrity audit first (valid links, policy budgets), commits only on the user’s explicit word, unrelated topics split into separate commits with brief indicative messages, never a push or a rewrite.';
+const GIT_SKILL_WHEN_TO_USE = 'Use when the user asks to commit the vault, save its changes to git, checkpoint them, or check whether pending vault changes are safe to commit — even when they say “salva in git” without naming the vault. A request to change the vault never implies this one.';
+
 /** Model-facing contract of the write tool; short because it is read on every request. */
 const WRITE_TOOL_DESCRIPTION =
 	'Write one UTF-8 file inside the vault folder configured in the Vault Tab plugin. Plugin Host code performs ' +
@@ -2016,6 +2034,543 @@ function infoTool(ctx, config) {
 	};
 }
 
+// --- Vault git -----------------------------------------------------------------
+//
+// The vault's history belongs to the user, and its policy (§10) is blunt: a
+// request to change something never implies a commit, and nothing repairs a
+// mistake by rewriting history. So this tool runs a fixed vocabulary —
+// `status`, `audit`, `commit` — through argv, never a shell string: `push`,
+// `reset`, `amend` and `rebase` are not merely discouraged, they are not
+// reachable. On top of the Vault Grant, `commit` holds two more locks: an
+// integrity audit whose token proves the tree was not touched since it passed,
+// and `confirm: true` the user gave for that exact plan of commits.
+
+/** Files one `status` reports; the count is exact, the list is the first `cap`. */
+const GIT_FILE_CAP = 500;
+
+/** Commits one `commit` call may carry; a bigger plan is one call away. */
+const GIT_COMMIT_CAP = 20;
+
+/** Code points in a commit message's first line: "breve e indicativo" has a number. */
+const GIT_SUBJECT_MAX = 120;
+
+/** git itself, always: fixed binary, fixed directory, no shell, no ambient locale. */
+function runGit(root, args, { allowFail = false } = {}) {
+	return new Promise((resolve, reject) => {
+		execFile(
+			'git',
+			['-C', root, ...args],
+			{ encoding: 'utf8', maxBuffer: 4 << 20, timeout: 30_000, env: { ...process.env, LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' } },
+			(error, stdout, stderr) => {
+				if (!error) return resolve(String(stdout ?? ''));
+				if (allowFail) return resolve(null);
+				reject(new Error(String((stderr && stderr.trim()) || error.message || 'git failed').slice(0, 400)));
+			},
+		);
+	});
+}
+
+/**
+ * The check every git action starts with: the write root must be the top of a
+ * repository. A vault nested inside a bigger repo is refused — committing there
+ * would speak for material outside the vault — and so is a folder with no git
+ * at all: initializing a repository is the user's decision, not a side effect.
+ */
+async function vaultRepo(root) {
+	const top = await runGit(root, ['rev-parse', '--show-toplevel'], { allowFail: true });
+	if (top === null) return { error: 'not-a-repo', hint: 'The vault folder is not a git repository (or git is unavailable): ask the user to create one, the tool never writes .git/.' };
+	const realTop = await realpath(top.trim()).catch(() => top.trim());
+	const realRoot = await realpath(root).catch(() => root);
+	if (realTop !== realRoot) return { error: 'not-vault-repo', hint: `The vault sits inside the repository at ${realTop}: commits there would reach material outside the vault. Ask the user how to proceed.` };
+	return { repo: true };
+}
+
+/**
+ * `git status --porcelain -z` as entries: two status letters, the path, and the
+ * original path of a staged rename. `-uall` lists untracked files one by one —
+ * a commit plan names files, never a directory someone might later drop other
+ * things into.
+ */
+async function gitStatusFiles(root) {
+	const raw = await runGit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+	const tokens = raw.split('\0');
+	const entries = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (!token || token.startsWith('##')) continue;
+		const xy = token.slice(0, 2);
+		const rel = token.slice(3).normalize('NFC');
+		if (!rel) continue;
+		const entry = { xy, path: rel };
+		if (xy.includes('R') || xy.includes('C')) {
+			const orig = String(tokens[++i] ?? '').normalize('NFC');
+			if (orig) entry.orig = orig;
+		}
+		entries.push(entry);
+	}
+	return entries;
+}
+
+/** Head, branch and dirty entries: the facts one call reports. */
+async function gitSnapshot(root) {
+	const head = ((await runGit(root, ['rev-parse', '--short', 'HEAD'], { allowFail: true })) ?? '').trim();
+	const branch = ((await runGit(root, ['symbolic-ref', '--short', 'HEAD'], { allowFail: true })) ?? '').trim();
+	const files = await gitStatusFiles(root);
+	return { head, branch, files };
+}
+
+/**
+ * The proof that the audited tree is still the tree: head plus, for every dirty
+ * path, its status letters, its rename origin and the hash of its current
+ * bytes. Any edit after an audit — a fixed link, an unlinked note — changes
+ * the token, so a commit can never carry content the audit never saw.
+ */
+async function treeToken(root, head, files) {
+	const lines = [`HEAD ${head}`];
+	for (const entry of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+		let content = 'gone';
+		try {
+			content = createHash('sha256').update(await readFile(path.join(root, entry.path), 'utf8')).digest('hex');
+		} catch (error) {
+			if (error && error.code !== 'ENOENT') content = 'unreadable';
+		}
+		lines.push(`${entry.xy} ${entry.path}${entry.orig ? ` <- ${entry.orig}` : ''} ${content}`);
+	}
+	return createHash('sha256').update(lines.join('\n')).digest('hex');
+}
+
+/** A suggested grouping of dirty paths: the folder one level below the section. */
+function groupDirtyPaths(files) {
+	const groups = new Map();
+	for (const entry of files) {
+		const segments = entry.path.split('/');
+		const group = segments.length === 1 ? '.' : segments.length <= 2 ? segments[0] : segments.slice(0, 2).join('/');
+		if (!groups.has(group)) groups.set(group, []);
+		groups.get(group).push(entry.path);
+	}
+	return [...groups.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([group, paths]) => ({ group, paths }));
+}
+
+/**
+ * The blocking/warning audit of a working tree, the same contract for `audit`
+ * and for the refusal inside `commit`:
+ *
+ * - every changed note passes the policy lint; a hard budget (a summary past
+ *   its maximum) blocks, the rest are warnings — except `broken-link`, which
+ *   the commit rule promotes: links must be valid;
+ * - every path the change removes or renames away is searched for referrers:
+ *   a link still pointing at what is gone is the change's own damage, and it
+ *   blocks. The scan is one pass over the notes, so a hundred deletions cost
+ *   one walk;
+ * - with `scope: 'vault'` the whole tree is link-checked and the pre-existing
+ *   rot is reported — never blocking: older notes are not this change's fault,
+ *   but a serious audit says what the vault actually looks like.
+ */
+async function auditWorkingTree(root, files, scope) {
+	const blocking = [];
+	const warnings = [];
+	const index = await buildPathIndex(root);
+	let scannedNotes = 0;
+
+	for (const entry of files) {
+		if (!entry.path.endsWith('.md') || entry.xy.includes('D')) continue;
+		let text;
+		try {
+			text = await readFile(path.join(root, entry.path), 'utf8');
+		} catch {
+			continue;
+		}
+		scannedNotes += 1;
+		const lint = await lintNote(root, entry.path, text, index);
+		for (const finding of lint.hard) blocking.push({ code: finding.code, path: entry.path, message: finding.message, ...(finding.examples?.length ? { examples: finding.examples } : {}) });
+		for (const finding of lint.soft) {
+			const item = { code: finding.code, path: entry.path, message: finding.message, ...(finding.examples?.length ? { examples: finding.examples } : {}) };
+			if (finding.code === 'broken-link') blocking.push(item);
+			else warnings.push(item);
+		}
+	}
+
+	const removed = new Map();
+	for (const entry of files) {
+		// The map speaks the link's language: `linkPath` drops the `.md` that git
+		// shows and vault links never carry, so [[some/note]] matches a deleted
+		// `some/note.md`. Attachments keep their extension on both sides.
+		if (entry.xy.includes('R')) removed.set(linkPath(entry.orig ?? entry.path), linkPath(entry.path));
+		else if (entry.xy.includes('D')) removed.set(linkPath(entry.path), '');
+	}
+	if (removed.size) {
+		const notes = [];
+		await collectMarkdown(root, notes, 0);
+		for (const file of notes) {
+			const rel = relPath(root, file);
+			let text;
+			try {
+				text = await readFile(file, 'utf8');
+			} catch {
+				continue;
+			}
+			for (const line of proseLines(text)) {
+				const masked = maskInlineCode(line.text);
+				LINK_PATTERN.lastIndex = 0;
+				let match;
+				while ((match = LINK_PATTERN.exec(masked))) {
+					const target = linkPath(match[1]);
+					if (!target || target.includes('<') || target.includes('>') || target.includes('…')) continue;
+					for (const [gone, into] of removed) {
+						if (!refersTo(target, gone, true)) continue;
+						// A link that still resolves is not this change's damage. The
+						// prefix rule speaks of folders, but git lists files: when
+						// `X.md` dies and the folder `X/` rises with notes inside,
+						// [[X/figlio]] points at a note that exists and [[X]] points
+						// at a folder, which the vault accepts. Only links left
+						// pointing at nothing block, so the audit catches the move
+						// half-done ([[X/dimenticato]], [[X]] with nothing behind it)
+						// and never the split that finished.
+						if (index.keys.has(target) || index.folders.has(target)) continue;
+						if (/\.[a-z0-9]{2,5}$/.test(target.split('/').pop())) {
+							let there = false;
+							try {
+								there = (await probe(path.join(root, target))).exists;
+							} catch {
+								there = false;
+							}
+							if (there) continue;
+						}
+						blocking.push({
+							code: 'link-to-removed',
+							path: rel,
+							line: line.line,
+							message: into ? `[[${target}]] still points at the old path; it now lives at [[${into}]].` : `[[${target}]] points at a path this change deletes.`,
+							examples: [`${rel}:${line.line}`],
+						});
+					}
+				}
+			}
+		}
+	}
+
+	let vault;
+	if (scope === 'vault') {
+		const notes = [];
+		await collectMarkdown(root, notes, 0);
+		const samples = [];
+		let broken = 0;
+		let notCanonical = 0;
+		for (const file of notes) {
+			if (samples.length >= 12 && broken + notCanonical >= 12) break;
+			const rel = relPath(root, file);
+			let text;
+			try {
+				text = await readFile(file, 'utf8');
+			} catch {
+				continue;
+			}
+			const found = await linkFindings(root, rel, text, index);
+			broken += found.broken.length;
+			notCanonical += found.notCanonical.length;
+			for (const target of found.broken) if (samples.length < 12) samples.push(`${rel} -> [[${target}]]`);
+			for (const target of found.notCanonical) if (samples.length < 12) samples.push(`${rel} -> [[${target}]] (short name)`);
+		}
+		vault = { scanned: notes.length, broken, notCanonical, samples };
+	}
+
+	return { blocking, warnings, scannedNotes, vault };
+}
+
+/**
+ * What a dirty index is made of: the staged paths, and among them the ones
+ * whose staged snapshot differs from the disk (second porcelain letter busy:
+ * MM, MD…). The first list is what unstaging would release; the second is
+ * what unstaging would DISCARD — an intermediate version newer or different
+ * from the files. "Unstaging" is the effect (empty the index back to HEAD,
+ * however the user gets it: `git restore --staged .` or a mixed `git reset`
+ * without arguments — commands that never touch the files or the history).
+ * The tool never resolves that tension itself, and never runs those commands:
+ * it shows the evidence, and the index stays the user's.
+ */
+function stagedInfo(files) {
+	const stagedPaths = files.filter((entry) => entry.xy[0] !== ' ' && entry.xy[0] !== '?').map((entry) => entry.path);
+	const stagedDifferFromWorktree = files.filter((entry) => entry.xy[0] !== ' ' && entry.xy[0] !== '?' && entry.xy[1] !== ' ' && entry.xy[1] !== '?').map((entry) => entry.path);
+	return { stagedPaths, stagedDifferFromWorktree };
+}
+
+/** Model-facing contract of the git tool. */
+const GIT_TOOL_DESCRIPTION =
+	'Commit the vault git working tree the way the vault policy allows: commit only on an explicit user request, never push or rewrite history. ' +
+	'action status (no Vault Grant): branch, dirty files grouped by folder, recent messages. action audit (no Grant): every changed note is linted and its links checked; links left pointing at deleted or renamed-away paths block. A clean audit returns auditToken, ' +
+	'which the first edit after it invalidates. action commit (Vault Grant + confirm: true + fresh auditToken): commits is a list of { message, paths } staged and committed in order — split unrelated topics into separate commits, brief indicative message in the language of the vault. ' +
+	'The tool never pushes, amends, resets or rebases, and its scope is the vault repository root only.';
+
+function gitTool(ctx, config) {
+	return {
+		name: 'vault_git',
+		description: GIT_TOOL_DESCRIPTION,
+		parameters: {
+			type: 'object',
+			properties: {
+				action: { type: 'string', enum: ['status', 'audit', 'commit'], description: 'Look, check integrity, or commit.' },
+				scope: { type: 'string', enum: ['changes', 'vault'], description: 'audit only: changes (default) checks what would be committed; vault also reports the pre-existing link health of the whole tree.' },
+				commits: {
+					type: 'array',
+					description: 'commit only: the plan, applied in order — one entry per commit, each staging exactly its paths.',
+					items: {
+						type: 'object',
+						properties: {
+							message: { type: 'string', description: 'Brief and indicative of what the commit does; first line ≤ 120 characters, optional body after it.' },
+							paths: { type: 'array', items: { type: 'string' }, description: 'Dirty files this commit takes, relative to the vault root — the status paths, verbatim.' },
+						},
+						required: ['message', 'paths'],
+						additionalProperties: false,
+					},
+				},
+				auditToken: { type: 'string', description: 'commit only: the token from the latest clean audit of this exact tree.' },
+				confirm: { type: 'boolean', description: 'commit only: true only when the user explicitly asked to commit and agreed to this plan.' },
+			},
+			additionalProperties: false,
+		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					root: { type: 'string', description: 'Absolute vault root the repository is at.' },
+					repo: { type: 'boolean', description: 'True when the root is a repository of its own; see error when it is not.' },
+					branch: { type: 'string', description: 'Current branch; empty on a detached head.' },
+					head: { type: 'string', description: 'Short sha of HEAD; empty before the first commit.' },
+					upstream: { type: 'string', description: 'Tracked remote branch, when the branch has one.' },
+					ahead: { type: 'integer', description: 'Commits ahead of the upstream.' },
+					behind: { type: 'integer', description: 'Commits behind the upstream.' },
+					staged: { type: 'boolean', description: 'True when the index already holds staged changes: commit refuses until the user resolves that.' },
+					stagedPaths: { type: 'array', items: { type: 'string' }, description: 'What is staged: the paths unstaging would release.' },
+					stagedDifferFromWorktree: { type: 'array', items: { type: 'string' }, description: 'Staged paths whose snapshot differs from the disk: what unstaging would discard. The files on disk stay untouched either way.' },
+					total: { type: 'integer', description: 'Dirty entries; files may be shorter.' },
+					files: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								status: { type: 'string', description: 'The two porcelain letters: first index, second work tree.' },
+								path: { type: 'string', description: 'Path relative to the vault root.' },
+								orig: { type: 'string', description: 'Rename source, for R entries.' },
+							},
+							additionalProperties: false,
+						},
+						description: 'The dirty files: what a commit could take.' },
+					groups: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { group: { type: 'string', description: 'The folder below the section, or "." at the root.' }, paths: { type: 'array', items: { type: 'string' } } },
+							additionalProperties: false,
+						},
+						description: 'A starting point for the topic split — refine it with the meaning of the change, not just the folder.',
+					},
+					recentCommits: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { sha: { type: 'string' }, message: { type: 'string' } },
+							additionalProperties: false,
+						},
+						description: 'The last messages: the language and shape the vault history uses.',
+					},
+					scope: { type: 'string', enum: ['changes', 'vault'], description: 'audit: what was checked.' },
+					blocking: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								code: { type: 'string', description: 'broken-link, link-to-removed, summary-too-long, …' },
+								path: { type: 'string', description: 'Where the problem lives.' },
+								line: { type: 'integer', description: 'The offending line, when known.' },
+								message: { type: 'string' },
+								examples: { type: 'array', items: { type: 'string' } },
+							},
+							additionalProperties: false,
+						},
+						description: 'What must be fixed before a commit; empty is the only passing result.',
+					},
+					warnings: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								code: { type: 'string' },
+								path: { type: 'string' },
+								message: { type: 'string' },
+								examples: { type: 'array', items: { type: 'string' } },
+							},
+							additionalProperties: false,
+						},
+						description: 'Policy findings that do not block: report them, fix what belongs to this change.',
+					},
+					scannedNotes: { type: 'integer', description: 'Changed notes linted.' },
+					vault: {
+						type: 'object',
+						properties: {
+							scanned: { type: 'integer', description: 'Notes link-checked across the tree.' },
+							broken: { type: 'integer', description: 'Broken links found anywhere, this change included.' },
+							notCanonical: { type: 'integer', description: 'Short-name links found anywhere.' },
+							samples: { type: 'array', items: { type: 'string' }, description: 'The first findings, as `note -> [[target]]`.' },
+						},
+						additionalProperties: false,
+						description: 'audit with scope vault: the pre-existing health, reported but never blocking.',
+					},
+					auditToken: { type: 'string', description: 'Valid only when blocking is empty: the proof of this exact tree. Pass it to commit.' },
+					committed: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								sha: { type: 'string', description: 'Short sha of the commit made.' },
+								message: { type: 'string', description: 'Its first line.' },
+								paths: { type: 'array', items: { type: 'string' }, description: 'What it took.' },
+							},
+							additionalProperties: false,
+						},
+						description: 'commit: the commits made, in order. They stand: the tool never rewrites them.',
+					},
+					leftUncommitted: { type: 'array', items: { type: 'string' }, description: 'Dirty files the plan did not take: say so plainly.' },
+					hint: { type: 'string', description: 'The next step, or why this was refused.' },
+					error: { type: 'string', description: 'Refusal reason.' },
+				},
+				additionalProperties: false,
+			},
+			render: (args, value) => [
+				{ type: 'text', text: value.error ? `vault_git ${args?.action ?? ''} refused (${value.error}): ${value.hint ?? ''}`.trimEnd() : JSON.stringify(value, null, 2) },
+			],
+		},
+		isConcurrencySafe: (args) => args?.action !== 'commit',
+		async execute(args, exec) {
+			const action = String(args?.action ?? '');
+			// Reading the repository is not a mutation: status and audit answer
+			// without the Grant, exactly like vault_search; only commit passes
+			// through the gate that writes.
+			const gate = action === 'commit' ? await mutationGate(ctx, config, exec, 'vault_git') : await readGate(ctx, config);
+			if (gate.error) return gate;
+			const repo = await vaultRepo(gate.root);
+			if (repo.error) return { root: gate.root, repo: false, error: repo.error, hint: repo.hint };
+			const root = gate.root;
+			const snapshot = await gitSnapshot(root);
+
+			if (action === 'status') {
+				const staged = stagedInfo(snapshot.files);
+				const out = {
+					root,
+					repo: true,
+					branch: snapshot.branch,
+					head: snapshot.head,
+					staged: staged.stagedPaths.length > 0,
+					...(staged.stagedPaths.length ? { stagedPaths: staged.stagedPaths.slice(0, GIT_FILE_CAP) } : {}),
+					...(staged.stagedDifferFromWorktree.length ? { stagedDifferFromWorktree: staged.stagedDifferFromWorktree.slice(0, GIT_FILE_CAP) } : {}),
+					total: snapshot.files.length,
+					files: snapshot.files.slice(0, GIT_FILE_CAP).map((entry) => ({ status: entry.xy, path: entry.path, ...(entry.orig ? { orig: entry.orig } : {}) })),
+					groups: groupDirtyPaths(snapshot.files),
+				};
+				const upstream = await runGit(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], { allowFail: true });
+				if (upstream) {
+					out.upstream = upstream.trim();
+					const counts = await runGit(root, ['rev-list', '--count', '--left-right', '@{upstream}...HEAD'], { allowFail: true });
+					const [behind, ahead] = String(counts ?? '').trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
+					if (Number.isFinite(ahead)) out.ahead = ahead;
+					if (Number.isFinite(behind)) out.behind = behind;
+				}
+				const log = await runGit(root, ['log', '--oneline', '-5'], { allowFail: true });
+				if (log) {
+					out.recentCommits = log
+						.trim()
+						.split('\n')
+						.map((line) => {
+							const at = line.indexOf(' ');
+							return { sha: line.slice(0, at), message: line.slice(at + 1) };
+						});
+				}
+				out.hint = snapshot.files.length ? 'Nothing is committed by looking: audit, propose a plan split by topic, and commit only when the user agrees.' : 'The working tree is clean.';
+				return out;
+			}
+
+			if (action === 'audit') {
+				const scope = args?.scope === 'vault' ? 'vault' : 'changes';
+				const audit = await auditWorkingTree(root, snapshot.files, scope);
+				const token = await treeToken(root, snapshot.head, snapshot.files);
+				const out = { root, repo: true, scope, blocking: audit.blocking, warnings: audit.warnings, scannedNotes: audit.scannedNotes };
+				if (audit.vault) out.vault = audit.vault;
+				if (!audit.blocking.length) out.auditToken = token;
+				out.hint = audit.blocking.length
+					? 'Fix every blocking finding, then audit again: the token only exists for a passing tree.'
+					: snapshot.files.length
+						? 'The tree passes. Propose the commit split to the user; this token commits it until the next edit.'
+						: 'Nothing is dirty: there is nothing to commit.';
+				return out;
+			}
+
+			// commit — the four locks, in order: capability, user consent, a
+			// passing audit of THIS tree, and a plan that names only dirty files.
+			if (currentValue(config.gitCommit) === false) return { root, error: 'git-disabled', hint: 'Git commits are switched off for this plugin: Plugins → Vault Tab → Git commits.' };
+			if (args?.confirm !== true) return { root, error: 'confirm-required', hint: 'A commit needs confirm: true, which means the user explicitly asked to commit and agreed to this exact plan. Ask first.' };
+			const name = ((await runGit(root, ['config', 'user.name'], { allowFail: true })) ?? '').trim();
+			const email = ((await runGit(root, ['config', 'user.email'], { allowFail: true })) ?? '').trim();
+			if (!name || !email) return { root, error: 'git-identity-missing', hint: 'The repository has no user.name/user.email: ask the user to set them, the tool never invents an identity.' };
+			const staged = stagedInfo(snapshot.files);
+			if (staged.stagedPaths.length) {
+				const differList = staged.stagedDifferFromWorktree.slice(0, 5).join(', ');
+				return {
+					root,
+					error: 'index-not-clean',
+					stagedPaths: staged.stagedPaths.slice(0, GIT_FILE_CAP),
+					...(staged.stagedDifferFromWorktree.length ? { stagedDifferFromWorktree: staged.stagedDifferFromWorktree.slice(0, GIT_FILE_CAP) } : {}),
+					hint: staged.stagedDifferFromWorktree.length
+						? `The git index already holds ${staged.stagedPaths.length} staged change(s) and ${staged.stagedDifferFromWorktree.length} of them (${differList}${staged.stagedDifferFromWorktree.length > 5 ? ', …' : ''}) differ from the files on disk: unstaging releases the index but DISCARDS those staged snapshots. Show both lists and let the user decide; the tool never touches the index.`
+						: `The git index already holds ${staged.stagedPaths.length} staged change(s), identical to the files on disk: unstaging (the user's own \`git restore --staged .\`, or a mixed \`git reset\` without arguments — files and history untouched) loses nothing. Ask the user; the tool never touches the index.`,
+				};
+			}
+			const fresh = await treeToken(root, snapshot.head, snapshot.files);
+			if (!args?.auditToken) return { root, error: 'audit-required', hint: 'Run vault_git audit first and pass its auditToken: nothing reaches history unchecked.' };
+			if (args.auditToken !== fresh) return { root, error: 'audit-stale', hint: 'The tree changed since the audit that issued that token: audit again, and re-check the plan still matches what you showed the user.' };
+
+			const plan = Array.isArray(args.commits) ? args.commits : null;
+			if (!plan?.length) return { root, error: 'invalid-plan', hint: 'commits must list at least one { message, paths }. Status shows the dirty files to plan from.' };
+			if (plan.length > GIT_COMMIT_CAP) return { root, error: 'invalid-plan', hint: `At most ${GIT_COMMIT_CAP} commits per call; split the plan across calls.` };
+			const dirty = new Map(snapshot.files.map((entry) => [entry.path, entry]));
+			const claimed = new Set();
+			const problems = [];
+			for (const [i, entry] of plan.entries()) {
+				const message = String(entry?.message ?? '');
+				if (!message.trim()) problems.push(`commit ${i + 1}: empty message`);
+				else {
+					const subject = message.trim().split('\n')[0];
+					if (textLength(subject) > GIT_SUBJECT_MAX) problems.push(`commit ${i + 1}: the first line is ${textLength(subject)} characters; keep it under ${GIT_SUBJECT_MAX} — the detail goes in the body`);
+				}
+				const paths = Array.isArray(entry?.paths) ? entry.paths : [];
+				if (!paths.length) problems.push(`commit ${i + 1}: no paths`);
+				for (const raw of paths) {
+					const rel = String(raw ?? '').normalize('NFC');
+					if (!dirty.has(rel)) problems.push(`commit ${i + 1}: ${rel} is not a dirty file of this tree`);
+					else if (claimed.has(rel)) problems.push(`${rel} appears in more than one commit`);
+					else claimed.add(rel);
+				}
+			}
+			if (problems.length) return { root, error: 'invalid-plan', hint: problems.slice(0, 8).join('; ') };
+
+			const committed = [];
+			for (const entry of plan) {
+				const paths = entry.paths.map((p) => String(p).normalize('NFC'));
+				try {
+					await runGit(root, ['add', '-A', '--', ...paths]);
+					await runGit(root, ['commit', '-m', String(entry.message).replace(/\s+$/, '')]);
+					const sha = ((await runGit(root, ['rev-parse', '--short', 'HEAD'])) ?? '').trim();
+					committed.push({ sha, message: String(entry.message).trim().split('\n')[0], paths });
+				} catch (error) {
+					const out = { root, error: 'commit-failed', committed, hint: `Commit ${committed.length + 1} failed (${String(error.message)}). The ${committed.length} already made stand — the tool never rewrites history. Report and wait for the user.` };
+					return out;
+				}
+			}
+			const out = { root, committed, leftUncommitted: snapshot.files.filter((entry) => !claimed.has(entry.path)).map((entry) => entry.path) };
+			out.hint = out.leftUncommitted.length ? `${out.leftUncommitted.length} file(s) are still uncommitted: tell the user.` : 'The history now holds exactly what the user agreed to.';
+			return out;
+		},
+	};
+}
+
 // --- Vault read tools --------------------------------------------------------
 //
 // They are registered on `tools` alone: no grant, no command, no sandbox policy.
@@ -2558,6 +3113,7 @@ export function apply(ctx, config) {
 		scope.effect(() => scope.tools.register(moveTool(scope, config)), 'dsh-vault-tab: move tool');
 		scope.effect(() => scope.tools.register(deleteTool(scope, config)), 'dsh-vault-tab: delete tool');
 		scope.effect(() => scope.tools.register(infoTool(scope, config)), 'dsh-vault-tab: info tool');
+		scope.effect(() => scope.tools.register(gitTool(scope, config)), 'dsh-vault-tab: git tool');
 		scope.effect(() => scope.tools.register(searchTool(scope, config)), 'dsh-vault-tab: search tool');
 		scope.effect(() => scope.tools.register(readTool(scope, config)), 'dsh-vault-tab: read tool');
 		scope.effect(() => scope.commands.register(writeCommand(scope, config)), 'dsh-vault-tab: write command');
@@ -2580,6 +3136,13 @@ export function apply(ctx, config) {
 			description: READ_SKILL_DESCRIPTION,
 			whenToUse: READ_SKILL_WHEN_TO_USE,
 			label: 'dsh-vault-tab: read skill',
+		});
+		registerTextSkill(scope, {
+			file: 'vault-git.md',
+			name: GIT_SKILL_NAME,
+			description: GIT_SKILL_DESCRIPTION,
+			whenToUse: GIT_SKILL_WHEN_TO_USE,
+			label: 'dsh-vault-tab: git skill',
 		});
 	});
 

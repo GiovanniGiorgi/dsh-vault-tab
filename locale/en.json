@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Vault Tab",
-    "description": "Adds a right-sidebar Vault tab: a file tree of a configured folder with native previews. Also gives a session the vault tools: vault_search and vault_read for grep-first retrieval (names and summaries, reference excluded), vault_note, vault_write, vault_move and vault_delete for writing, gated per session by a Vault Grant in the composer and linted against the vault's POLICY.md. An optional vault-setup skill creates or adopts that folder; switch it off once the vault exists."
+    "description": "Adds a right-sidebar Vault tab: a file tree of a configured folder with native previews. Also gives a session the vault tools: vault_search and vault_read for grep-first retrieval (names and summaries, reference excluded), vault_note, vault_write, vault_move and vault_delete for writing, gated per session by a Vault Grant in the composer and linted against the vault's POLICY.md, and vault_git to commit audited changes only when you explicitly ask. An optional vault-setup skill creates or adopts that folder; switch it off once the vault exists."
   }
 }

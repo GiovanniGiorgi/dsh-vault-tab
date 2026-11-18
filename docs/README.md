@@ -1,6 +1,6 @@
 # The skills of Vault Tab
 
-Three skills ship with the plugin. They are the part that teaching can do: the
+Four skills ship with the plugin. They are the part that teaching can do: the
 tools guarantee *shapes and permissions*, the skills teach *behaviour* — what to
 do before writing, what to read first, when to stop and ask.
 
@@ -9,8 +9,9 @@ do before writing, what to read first, when to stop and ask.
 | `vault-setup` | prepare the folder | `skills/vault-setup.md` | only while **Vault setup skill** is on (Plugins → Vault Tab) |
 | `vault-write` | change the vault | `skills/vault-write.md` | always |
 | `vault-read` | find things in it | `skills/vault-read.md` | always |
+| `vault-git` | commit what was agreed | `skills/vault-git.md` | always |
 
-## Why three, and why this cut
+## Why four, and why this cut
 
 Reading and writing the vault are different jobs with different risks, so they get
 different teaching and different gates:
@@ -22,6 +23,9 @@ different teaching and different gates:
   `skills` scope and are always registered.
 - **`vault-write`** covers mutations, and starts from the one thing the tools
   cannot decide: whether the *user* has opened the Vault Grant for this session.
+- **`vault-git`** covers history, which the vault's policy (§10) treats as the
+  user's: it teaches the audit → plan → agree → commit order, and the tool makes
+  the rest structural — `push`, `reset`, `amend` and `rebase` are not reachable.
 - **`vault-setup`** is one-shot by nature. It exists until the vault exists, then
   it costs context in every session for a job already done — so it retires
   itself, and the switch stays available to bring it back.
@@ -67,6 +71,7 @@ warning in the log.
 | "set up my vault here" / the path is empty | `vault-setup` | `vault_setup` (`inspect`, `create`, `set-root`, `write-policy`, `hide-skill`) |
 | "note this", "save it", "rename that", "delete it" | `vault-write` | `vault_note`, `vault_write`, `vault_move`, `vault_delete`, `vault_info` |
 | "what do I have about X", "find the note on Y" | `vault-read` | `vault_search`, `vault_read` |
+| "commit the vault", "save these changes to git" | `vault-git` | `vault_git` (`status`, `audit`, `commit`) |
 | "search it and write down what's missing" | `vault-read`, then `vault-write` | both sets |
 
 ## Editing one
@@ -75,9 +80,9 @@ warning in the log.
    instructions to the assistant, not as documentation about the plugin.
 2. If the change moves *when* the skill applies, edit the matching
    `*_WHEN_TO_USE` / `*_DESCRIPTION` in `index.js`.
-3. Run `npm test` in the plugin folder — 83 checks cover the tools the skills
+3. Run `npm test` in the plugin folder — 111 checks cover the tools the skills
    describe, including the wording of the refusals they tell the model to expect.
 4. Reload the plugin row (or restart DSH): skills are read at activation.
-4. Keep the three files symmetrical: ground rules first, then the flow, then the
+5. Keep the skill files symmetrical: ground rules first, then the flow, then the
    contract of the tools they use, then what they refuse. These `docs/` pages
    explain the reasoning; the skill files stay the instructions a model runs.

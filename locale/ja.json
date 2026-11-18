@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Vault Tab",
-    "description": "右サイドバーに Vault タブを追加：設定済みフォルダーのファイルツリーをネイティブプレビューで表示します。セッションには vault のツールも提供します：grep-first 検索の vault_search と vault_read（名前とサマリーが対象、reference は除外）、書き込み用の vault_note、vault_write、vault_move、vault_delete。書き込みは composer の Vault Grant によりセッション単位で許可され、vault の POLICY.md に基づき検査されます。任意の vault-setup スキルがフォルダーを作成・取り込みます。vault があればオフにできます。"
+    "description": "右サイドバーに Vault タブを追加：設定済みフォルダーのファイルツリーをネイティブプレビューで表示します。セッションには vault のツールも提供します：grep-first 検索の vault_search と vault_read（名前とサマリーが対象、reference は除外）、書き込み用の vault_note、vault_write、vault_move、vault_delete。書き込みは composer の Vault Grant によりセッション単位で許可され、vault の POLICY.md に基づき検査されます。明示的な依頼と整合性監査を条件にコミットする vault_git も利用できます。任意の vault-setup スキルがフォルダーを作成・取り込みます。vault があればオフにできます。"
   }
 }

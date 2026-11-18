@@ -4,7 +4,7 @@ A [DSH](https://npmjs.com/package/@deepseek-ai/dsh) plugin that keeps a notes
 folder — a second brain, an Obsidian vault, a documents tree — usable in every
 session, regardless of the workspace that session happens to be in.
 
-Three capabilities, one configured root, one bundle:
+Four capabilities, one configured root, one bundle:
 
 - **View** — a **Vault** tab in the right sidebar: a file tree of the folder, with
   previews through the built-in Document viewer.
@@ -14,6 +14,9 @@ Three capabilities, one configured root, one bundle:
 - **Read** — the `vault_search` and `vault_read` tools: grep-first retrieval over
   file names and summaries, with region reads for deep dives. Reading is never
   gated.
+- **Commit** — `vault_git` commits the vault repository only when the user asked,
+  and only after an integrity audit of the working tree passes: valid links and
+  policy budgets, unrelated topics split into separate commits.
 
 ## Features
 
@@ -29,8 +32,11 @@ Three capabilities, one configured root, one bundle:
   reported as warnings, refused only where the vault would stop being searchable
 - Retrieval by metadata (names + summaries), by folder inventory, and full-text
   with numbered lines; `90-Reference/` and `99-Templates/` stay out of search
-- `vault-setup`, `vault-write` and `vault-read` skills teach the same conventions
-  the tools enforce
+- `vault-setup`, `vault-write`, `vault-read` and `vault-git` skills teach the same
+  conventions the tools enforce
+- Git commits the way the vault's policy (§10) allows: `vault_git` never pushes,
+  amends, resets or rebases; a commit needs the Grant, `confirm: true` and an
+  `auditToken` from a clean audit that dies with the next edit
 - Single small bundle
 
 ## Requirements
@@ -90,6 +96,7 @@ instead of failing silently.
 | `vault_move` | rename or move, rewriting the `[[…]]` links that pointed at the old path |
 | `vault_delete` | removes a file or folder; refuses when notes still link it, until you saw the referrers |
 | `vault_info` | facts about the vault: root, write root, policy present, grant state |
+| `vault_git` | the vault repository: `status` (dirty files, groups, recent messages), `audit` (links + policy over what would be committed, `scope: "vault"` for the whole tree), `commit` (a list of `{ message, paths }` applied in order — needs the Grant, `confirm: true` and a fresh `auditToken`) |
 | `vault_setup` | creates or adopts the folder this tab lists (see below) |
 
 `/vault-write` in the composer shows or flips this session's Vault Grant
@@ -115,6 +122,9 @@ what it teaches, which tool contract and which refusal it drives.
 - **`vault-read`** — how to answer from the vault: the search loop, keyword
   discipline, inventory vs full-text, reading a region instead of a file, citing
   with the path you read.
+- **`vault-git`** — how to commit: audit before proposing, split unrelated topics
+  into separate commits with brief messages, agree the plan with the user, never
+  push or rewrite.
 
 ## First-time vault
 
@@ -152,6 +162,10 @@ policy stays the only place they are written down.
   relative traversal and symlinks cannot escape it
 - Writing needs the Vault Grant; deletion additionally needs your confirmation for
   folders, and refuses while other notes link the target
+- Committing additionally needs a clean integrity audit whose token is bound to
+  the exact bytes checked, and `confirm: true` after you agreed to that plan; git
+  runs as fixed argv inside the vault repository only — push, reset, amend and
+  rebase are unreachable, `.git/` is never written
 - Writes are atomic (temp file plus rename) and capped at 1 MiB; binaries are read
   as such, not dumped into context
 - Previews follow the session's own file-read permissions
