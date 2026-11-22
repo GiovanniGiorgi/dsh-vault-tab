@@ -1,6 +1,6 @@
 ---
 name: vault-write
-description: Create, edit, move and delete notes in a markdown vault (PARA + wiki links + MOC indexes) with the plain file tools — any editing style, but every change ends integrity-checked: no link resolving to nothing, no note unindexed, no dangling referrer after a move or delete. Use when asked to save, fix, reorganize or clean up vault content.
+description: "Create, edit, move and delete notes in a markdown vault (PARA + wiki links + MOC indexes) with the plain file tools — any editing style, but every change ends integrity-checked: no link resolving to nothing, no note unindexed, no dangling referrer after a move or delete. Use when asked to save, fix, reorganize or clean up vault content."
 ---
 
 # Writing into the vault

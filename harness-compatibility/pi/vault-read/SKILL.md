@@ -1,6 +1,6 @@
 ---
 name: vault-read
-description: Retrieve from a markdown vault (PARA + wiki links + MOC indexes) with the plain tools — file names and summary: lines first, bodies only for picked notes, reference folders never searched — and report what the vault does not hold. Use when asked to find, recall, or survey notes in a vault.
+description: "Retrieve from a markdown vault (PARA + wiki links + MOC indexes) with the plain tools — file names and summary: lines first, bodies only for picked notes, reference folders never searched — and report what the vault does not hold. Use when asked to find, recall, or survey notes in a vault."
 ---
 
 # Reading the vault

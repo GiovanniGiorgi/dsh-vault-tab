@@ -1,6 +1,6 @@
 ---
 name: vault-git
-description: Commit a markdown vault's git working tree — integrity audit first (no broken or dangling links, budgets respected), commits only on the user's explicit word, unrelated topics split into separate commits with brief indicative messages in the vault's own style, never a push or a history rewrite. Use when the user asks to commit, checkpoint or save the vault's history.
+description: "Commit a markdown vault's git working tree — integrity audit first (no broken or dangling links, budgets respected), commits only on the user's explicit word, unrelated topics split into separate commits with brief indicative messages in the vault's own style, never a push or a history rewrite. Use when the user asks to commit, checkpoint or save the vault's history."
 ---
 
 # Committing the vault
