@@ -178,4 +178,4 @@ stays in the profile patch; remove it there if you want a clean slate.
 
 ## License
 
-See the source repository.
+MIT — see [LICENSE](LICENSE).
